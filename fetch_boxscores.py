@@ -90,8 +90,8 @@ def fetch_game_boxscore(game_id):
                 result[f"{side}_BENCH_PTS"] = 0
                 continue
 
-            # Star player = highest FGA (matches training definition)
-            star = max(pdata, key=lambda x: x["fga"])
+            # Star player = highest minutes (matches inference definition in server.py)
+            star = max(pdata, key=lambda x: x["mins"])
             result[f"{side}_STAR_PM"] = star["pm"]
             result[f"{side}_STAR_MINS_TOTAL"] = star["mins"]
 
