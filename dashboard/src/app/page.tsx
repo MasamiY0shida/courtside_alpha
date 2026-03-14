@@ -1,6 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import {
+  ComposedChart, Area, Line, XAxis, YAxis,
+  Tooltip, Legend, ResponsiveContainer, ReferenceLine,
+  BarChart, Bar,
+} from "recharts";
 
 interface Trade {
   id:                  string;
@@ -247,6 +252,34 @@ export default function Dashboard() {
               {liveGames.map(g => (
                 <LiveGameCard key={g.game_id} game={g} />
               ))}
+            </div>
+          </section>
+        )}
+
+        {/* ── Confidence Interval Chart ── */}
+        {trades.length >= 2 && (
+          <section>
+            <SectionHeader label="Model vs Market — Confidence Intervals" count={-1} color="text-purple-400" />
+            <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+
+              {/* Time-series CI chart */}
+              <div className="xl:col-span-2 bg-gray-900 border border-gray-800 rounded-lg p-5">
+                <p className="text-xs text-gray-500 mb-1 uppercase tracking-widest">Probability Over Trades</p>
+                <p className="text-xs text-gray-600 mb-4">
+                  Purple band = model ±5% CI (edge threshold). Trades trigger when market exits this band.
+                </p>
+                <ProbabilityChart trades={[...trades].slice(0, 30).reverse()} />
+              </div>
+
+              {/* Edge distribution bar chart */}
+              <div className="bg-gray-900 border border-gray-800 rounded-lg p-5">
+                <p className="text-xs text-gray-500 mb-1 uppercase tracking-widest">Edge Distribution</p>
+                <p className="text-xs text-gray-600 mb-4">
+                  Model edge per trade. Green = positive (model &gt; market).
+                </p>
+                <EdgeChart trades={[...trades].slice(0, 20).reverse()} />
+              </div>
+
             </div>
           </section>
         )}
@@ -530,6 +563,100 @@ function ProbBar({ label, value, color }: { label: string; value: number; color:
       </div>
       <span className="text-gray-300 w-12 font-bold">{(value * 100).toFixed(1)}%</span>
     </div>
+  );
+}
+
+// ── Chart tooltip ──
+function ProbTooltip({ active, payload, label }: {
+  active?: boolean; payload?: Array<{ dataKey: string; value: number }>; label?: string;
+}) {
+  if (!active || !payload?.length) return null;
+  const model  = payload.find(p => p.dataKey === "model");
+  const market = payload.find(p => p.dataKey === "market");
+  const edge   = model && market ? model.value - market.value : null;
+  return (
+    <div className="bg-gray-950 border border-gray-700 rounded-md px-3 py-2 text-xs space-y-1">
+      <p className="text-gray-400 font-semibold">{label}</p>
+      {model  && <p className="text-purple-400">Model:  {model.value.toFixed(1)}%</p>}
+      {market && <p className="text-yellow-400">Market: {market.value.toFixed(1)}%</p>}
+      {edge != null && (
+        <p className={`font-bold ${edge >= 0 ? "text-green-400" : "text-red-400"}`}>
+          Edge: {edge >= 0 ? "+" : ""}{edge.toFixed(1)}%
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ProbabilityChart({ trades }: { trades: Trade[] }) {
+  const CI = 5;
+  const data = trades.map(t => {
+    const modelPct = +(t.model_implied_prob * 100).toFixed(1);
+    const low      = +Math.max(0,   modelPct - CI).toFixed(1);
+    const high     = +Math.min(100, modelPct + CI).toFixed(1);
+    return {
+      label:   t.target_team.split(" ").slice(-1)[0],
+      market:  +(t.market_implied_prob * 100).toFixed(1),
+      model:   modelPct,
+      ciBase:  low,
+      ciWidth: +(high - low).toFixed(1),
+    };
+  });
+
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <ComposedChart data={data} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
+        <defs>
+          <linearGradient id="ciGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%"   stopColor="#8b5cf6" stopOpacity={0.30} />
+            <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.05} />
+          </linearGradient>
+        </defs>
+        <XAxis dataKey="label" tick={{ fill: "#6b7280", fontSize: 10 }} tickLine={false} axisLine={{ stroke: "#374151" }} />
+        <YAxis domain={[0, 100]} tick={{ fill: "#6b7280", fontSize: 10 }} tickLine={false} axisLine={false}
+               tickFormatter={v => `${v}%`} width={38} />
+        <Tooltip content={<ProbTooltip />} />
+        <Legend wrapperStyle={{ fontSize: "11px", paddingTop: "10px" }}
+                formatter={v => <span style={{ color: "#9ca3af" }}>{v}</span>} />
+        <ReferenceLine y={50} stroke="#374151" strokeDasharray="3 3" />
+        {/* CI band via stacked areas */}
+        <Area type="monotone" dataKey="ciBase"  stackId="ci" stroke="none" fill="transparent" legendType="none" tooltipType="none" />
+        <Area type="monotone" dataKey="ciWidth" stackId="ci" stroke="none" fill="url(#ciGrad)" name="Model CI (±5%)" legendType="square" />
+        {/* Probability lines */}
+        <Line type="monotone" dataKey="model"  name="Model Probability"  stroke="#8b5cf6" strokeWidth={2}
+              dot={{ r: 3, fill: "#8b5cf6", strokeWidth: 0 }} activeDot={{ r: 5 }} />
+        <Line type="monotone" dataKey="market" name="Market Probability" stroke="#f59e0b" strokeWidth={2}
+              strokeDasharray="5 3" dot={{ r: 3, fill: "#f59e0b", strokeWidth: 0 }} activeDot={{ r: 5 }} />
+      </ComposedChart>
+    </ResponsiveContainer>
+  );
+}
+
+function EdgeChart({ trades }: { trades: Trade[] }) {
+  const data = trades.map(t => ({
+    label: t.target_team.split(" ").slice(-1)[0],
+    edge:  +((t.model_implied_prob - t.market_implied_prob) * 100).toFixed(1),
+  }));
+
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <BarChart data={data} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
+        <XAxis dataKey="label" tick={{ fill: "#6b7280", fontSize: 10 }} tickLine={false} axisLine={{ stroke: "#374151" }} />
+        <YAxis tick={{ fill: "#6b7280", fontSize: 10 }} tickLine={false} axisLine={false}
+               tickFormatter={v => `${v}%`} width={38} />
+        <Tooltip
+          contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155", borderRadius: "6px", fontSize: "11px" }}
+          labelStyle={{ color: "#94a3b8" }}
+          formatter={(v: number) => [`${v >= 0 ? "+" : ""}${v}%`, "Edge"]}
+        />
+        <ReferenceLine y={0} stroke="#374151" />
+        <Bar dataKey="edge" name="Edge" shape={(props: any) => {
+          const { x, y, width, height } = props;
+          const fill = (props.value ?? 0) >= 0 ? "#4ade80" : "#f87171";
+          return <rect x={x} y={y} width={width} height={Math.abs(height)} fill={fill} fillOpacity={0.85} rx={2} />;
+        }} />
+      </BarChart>
+    </ResponsiveContainer>
   );
 }
 
