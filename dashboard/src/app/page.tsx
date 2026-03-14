@@ -25,6 +25,37 @@ interface WalletInfo {
   initial_usdc: number;
 }
 
+interface LiveGame {
+  game_id:      string;
+  home_team:    string;
+  away_team:    string;
+  home_team_id: number;
+  away_team_id: number;
+  score:        { home: number; away: number };
+  period:       number;
+  game_clock:   string;
+  predictions: {
+    win_probability:   number;
+    proxy_probability: number;
+    predicted_margin:  number;
+    edge:              number;
+    abs_edge:          number;
+    edge_confidence:   number;
+    kelly_size:        number;
+  };
+  market_odds: {
+    polymarket_prob:  number | null;
+    market_edge:      number | null;
+    market_abs_edge:  number | null;
+    source:           string | null;
+    volume:           number | null;
+    spread:           number | null;
+    total:            number | null;
+  };
+  signals:      unknown[];
+  signal_count: number;
+}
+
 function fmt(dt: string) {
   return new Date(dt).toLocaleString(undefined, {
     month: "short", day: "numeric",
@@ -40,6 +71,7 @@ function shortHash(h: string | null, len = 10): string {
 export default function Dashboard() {
   const [trades, setTrades]         = useState<Trade[]>([]);
   const [wallet, setWallet]         = useState<WalletInfo | null>(null);
+  const [liveGames, setLiveGames]   = useState<LiveGame[]>([]);
   const [loading, setLoading]       = useState(true);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [connected, setConnected]   = useState(false);
@@ -53,6 +85,16 @@ export default function Dashboard() {
         ]);
         setTrades(await tradesRes.json());
         setWallet(await walletRes.json());
+
+        // Fetch live games from server.py (non-blocking — may not be running)
+        try {
+          const gamesRes = await fetch("/api/games");
+          if (gamesRes.ok) {
+            const data = await gamesRes.json();
+            setLiveGames(data.games ?? []);
+          }
+        } catch { /* server.py may not be running */ }
+
         setLastUpdated(new Date());
         setConnected(true);
       } catch {
@@ -79,6 +121,12 @@ export default function Dashboard() {
     ? trades.reduce((s, t) => s + Math.abs(t.model_implied_prob - t.market_implied_prob), 0) / trades.length * 100
     : null;
   const signedCount = trades.filter(t => t.order_hash).length;
+
+  // Market edge stats from live games
+  const gamesWithMarket = liveGames.filter(g => g.market_odds?.polymarket_prob != null);
+  const avgMarketEdge = gamesWithMarket.length > 0
+    ? gamesWithMarket.reduce((s, g) => s + Math.abs(g.market_odds.market_edge ?? 0), 0) / gamesWithMarket.length * 100
+    : null;
 
   const openTrades = trades.filter(t => t.status === "OPEN");
 
@@ -152,7 +200,7 @@ export default function Dashboard() {
         )}
 
         {/* ── Stats bar ── */}
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
           <StatCard
             label="Simulated PnL"
             value={`${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`}
@@ -172,17 +220,36 @@ export default function Dashboard() {
             sub={open > 0 ? "awaiting resolution" : "none active"}
           />
           <StatCard
-            label="Total Trades"
-            value={String(trades.length)}
-            color="text-gray-300"
+            label="Live Games"
+            value={String(liveGames.length)}
+            color="text-cyan-400"
+            sub={gamesWithMarket.length > 0 ? `${gamesWithMarket.length} with market odds` : "no market data"}
           />
           <StatCard
             label="Avg Edge"
             value={avgEdge != null ? `${avgEdge.toFixed(1)}%` : "—"}
             color="text-purple-400"
-            sub="model vs market"
+            sub="model vs market (trades)"
+          />
+          <StatCard
+            label="Market Edge"
+            value={avgMarketEdge != null ? `${avgMarketEdge.toFixed(1)}%` : "—"}
+            color="text-orange-400"
+            sub="live model vs Polymarket"
           />
         </div>
+
+        {/* ── Live Games — Model vs Market ── */}
+        {liveGames.length > 0 && (
+          <section>
+            <SectionHeader label="Live Games — Model vs Market" count={liveGames.length} pulse color="text-cyan-400" />
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              {liveGames.map(g => (
+                <LiveGameCard key={g.game_id} game={g} />
+              ))}
+            </div>
+          </section>
+        )}
 
         {/* ── Active Positions ── */}
         {(loading || openTrades.length > 0) && (
@@ -369,6 +436,99 @@ function DataPoint({ label, children }: { label: string; children: React.ReactNo
     <div>
       <span className="text-gray-600 block">{label}</span>
       <div className="mt-0.5">{children}</div>
+    </div>
+  );
+}
+
+function LiveGameCard({ game }: { game: LiveGame }) {
+  const modelProb  = game.predictions.win_probability;
+  const marketProb = game.market_odds?.polymarket_prob;
+  const marketEdge = game.market_odds?.market_edge;
+  const proxyProb  = game.predictions.proxy_probability;
+  const margin     = game.predictions.predicted_margin;
+  const confidence = game.predictions.edge_confidence;
+  const kelly      = game.predictions.kelly_size;
+  const hasMarket  = marketProb != null;
+
+  const edgeVal    = hasMarket ? (marketEdge ?? 0) : game.predictions.edge;
+  const edgePct    = edgeVal * 100;
+
+  return (
+    <div className="bg-gray-900 border border-cyan-900/30 rounded-lg p-4 space-y-3 hover:border-cyan-700/40 transition-colors">
+      {/* Header: teams + score */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-gray-200 font-bold text-sm">{game.home_team}</span>
+          <span className="text-gray-600 text-xs">vs</span>
+          <span className="text-gray-200 font-bold text-sm">{game.away_team}</span>
+        </div>
+        <div className="text-right">
+          <span className="text-gray-100 font-bold text-lg">{game.score.home}-{game.score.away}</span>
+          <span className="text-gray-500 text-xs ml-2">Q{game.period}</span>
+        </div>
+      </div>
+
+      {/* Probability comparison bars */}
+      <div className="space-y-2">
+        <ProbBar label="Model" value={modelProb} color="bg-green-500" />
+        {hasMarket ? (
+          <ProbBar label="Market" value={marketProb!} color="bg-blue-500" />
+        ) : (
+          <ProbBar label="Proxy" value={proxyProb} color="bg-gray-500" />
+        )}
+      </div>
+
+      {/* Edge + metrics */}
+      <div className="grid grid-cols-3 gap-x-4 gap-y-1 text-xs">
+        <DataPoint label="Edge">
+          <span className={`font-bold ${edgePct >= 0 ? "text-green-400" : "text-red-400"}`}>
+            {edgePct >= 0 ? "+" : ""}{edgePct.toFixed(1)}%
+          </span>
+        </DataPoint>
+        <DataPoint label="Confidence">
+          <span className={`font-bold ${confidence >= 0.6 ? "text-green-400" : "text-gray-400"}`}>
+            {(confidence * 100).toFixed(0)}%
+          </span>
+        </DataPoint>
+        <DataPoint label="Kelly">
+          <span className="text-purple-400 font-bold">{(kelly * 100).toFixed(1)}%</span>
+        </DataPoint>
+        <DataPoint label="Margin">
+          <span className="text-gray-300">{margin >= 0 ? "+" : ""}{margin.toFixed(1)}</span>
+        </DataPoint>
+        <DataPoint label="Signals">
+          <span className={game.signal_count > 0 ? "text-yellow-400 font-bold" : "text-gray-600"}>
+            {game.signal_count}
+          </span>
+        </DataPoint>
+        {hasMarket && game.market_odds.volume != null && (
+          <DataPoint label="Volume">
+            <span className="text-gray-400">${(game.market_odds.volume! / 1000).toFixed(0)}k</span>
+          </DataPoint>
+        )}
+      </div>
+
+      {/* Source tag */}
+      <div className="flex items-center justify-between pt-2 border-t border-gray-800 text-xs">
+        <span className="text-gray-600">
+          {hasMarket ? `via ${game.market_odds.source}` : "proxy model baseline"}
+        </span>
+        <span className={`font-bold text-sm ${Math.abs(edgePct) >= 5 ? (edgePct >= 0 ? "text-green-400" : "text-red-400") : "text-gray-500"}`}>
+          {Math.abs(edgePct) >= 5 ? "SIGNAL" : "NO EDGE"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function ProbBar({ label, value, color }: { label: string; value: number; color: string }) {
+  return (
+    <div className="flex items-center gap-2 text-xs">
+      <span className="text-gray-500 w-12 text-right">{label}</span>
+      <div className="flex-1 bg-gray-800 rounded-full h-3 overflow-hidden">
+        <div className={`${color} h-full rounded-full transition-all duration-500`} style={{ width: `${Math.max(2, value * 100)}%` }} />
+      </div>
+      <span className="text-gray-300 w-12 font-bold">{(value * 100).toFixed(1)}%</span>
     </div>
   );
 }

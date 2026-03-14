@@ -35,7 +35,9 @@ use uuid::Uuid;
 
 const GAMMA_API:        &str = "https://gamma-api.polymarket.com";
 const POLYMARKET_WS:    &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-const ALPHA_ENGINE_URL: &str = "http://127.0.0.1:8000";
+const ALPHA_ENGINE_URL: &str = "http://127.0.0.1:8001";
+/// server.py live inference server (for live game state lookups).
+const SERVER_URL:       &str = "http://127.0.0.1:8000";
 const DB_PATH:          &str = "../trades.sqlite";
 
 /// Minimum |model_prob − market_prob| to trigger a signed shadow trade.
@@ -70,6 +72,7 @@ struct Token {
     token_id:  String,
     team_name: String,
     is_home:   bool,
+    team_id:   Option<i64>,
     #[allow(dead_code)]
     price:     f64,
 }
@@ -113,20 +116,29 @@ struct WsSubscribe {
 
 #[derive(Serialize)]
 struct GameStateRequest {
+    home_team_id:      i64,
+    away_team_id:      i64,
     period:            i32,
     game_seconds_left: f64,
     home_score:        f64,
     away_score:        f64,
-    margin:            f64,
-    abs_margin:        f64,
-    total_points:      f64,
-    scoring_pace:      f64,
 }
 
 #[derive(Deserialize)]
 struct PredictResponse {
-    win_probability: f64,
-    model_loaded:    bool,
+    win_probability:   f64,
+    #[allow(dead_code)]
+    proxy_probability: f64,
+    #[allow(dead_code)]
+    predicted_margin:  f64,
+    #[allow(dead_code)]
+    edge:              f64,
+    #[allow(dead_code)]
+    abs_edge:          f64,
+    edge_confidence:   f64,
+    #[allow(dead_code)]
+    kelly_size:        f64,
+    model_loaded:      bool,
 }
 
 // ── In-memory registry ────────────────────────────────────────────────────────
@@ -138,6 +150,8 @@ struct MarketEntry {
     token_id:        String,
     team_name:       String,
     is_home:         bool,
+    home_team_id:    Option<i64>,
+    away_team_id:    Option<i64>,
     game_start_time: String,
 }
 
@@ -471,6 +485,45 @@ async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
     }
 }
 
+// ── NBA team name → NBA API team ID mapping ──────────────────────────────────
+
+fn team_name_to_id(name: &str) -> Option<i64> {
+    let lower = name.to_lowercase();
+    match lower.as_str() {
+        "hawks"           | "atlanta"      => Some(1610612737),
+        "celtics"         | "boston"        => Some(1610612738),
+        "nets"            | "brooklyn"     => Some(1610612751),
+        "hornets"         | "charlotte"    => Some(1610612766),
+        "bulls"           | "chicago"      => Some(1610612741),
+        "cavaliers" | "cavs" | "cleveland" => Some(1610612739),
+        "mavericks" | "mavs" | "dallas"    => Some(1610612742),
+        "nuggets"         | "denver"       => Some(1610612743),
+        "pistons"         | "detroit"      => Some(1610612765),
+        "warriors"        | "golden state" => Some(1610612744),
+        "rockets"         | "houston"      => Some(1610612745),
+        "pacers"          | "indiana"      => Some(1610612754),
+        "clippers"        | "la clippers"  => Some(1610612746),
+        "lakers"          | "la lakers" | "los angeles lakers" => Some(1610612747),
+        "grizzlies"       | "memphis"      => Some(1610612763),
+        "heat"            | "miami"        => Some(1610612748),
+        "bucks"           | "milwaukee"    => Some(1610612749),
+        "timberwolves" | "wolves" | "minnesota" => Some(1610612750),
+        "pelicans"        | "new orleans"  => Some(1610612740),
+        "knicks"          | "new york"     => Some(1610612752),
+        "thunder"         | "oklahoma city" | "okc" => Some(1610612760),
+        "magic"           | "orlando"      => Some(1610612753),
+        "76ers" | "sixers" | "philadelphia" => Some(1610612755),
+        "suns"            | "phoenix"      => Some(1610612756),
+        "trail blazers" | "blazers" | "portland" => Some(1610612757),
+        "kings"           | "sacramento"   => Some(1610612758),
+        "spurs"           | "san antonio"  => Some(1610612759),
+        "raptors"         | "toronto"      => Some(1610612761),
+        "jazz"            | "utah"         => Some(1610612762),
+        "wizards"         | "washington"   => Some(1610612764),
+        _ => None,
+    }
+}
+
 // ── Gamma API: discover live NBA moneyline markets ───────────────────────────
 
 async fn fetch_nba_markets(http: &Client) -> Result<Vec<Market>> {
@@ -530,11 +583,16 @@ async fn fetch_nba_markets(http: &Client) -> Result<Vec<Market>> {
                     None => vec![0.5; token_ids.len()],
                 };
 
-                let tokens: Vec<Token> = token_ids.into_iter().enumerate().map(|(i, id)| Token {
-                    token_id:  id,
-                    team_name: team_names.get(i).cloned().unwrap_or_else(|| "Unknown".into()),
-                    is_home:   i == 1,
-                    price:     *prices.get(i).unwrap_or(&0.5),
+                let tokens: Vec<Token> = token_ids.into_iter().enumerate().map(|(i, id)| {
+                    let name = team_names.get(i).cloned().unwrap_or_else(|| "Unknown".into());
+                    let tid = team_name_to_id(&name);
+                    Token {
+                        token_id:  id,
+                        team_name: name,
+                        is_home:   i == 1,
+                        team_id:   tid,
+                        price:     *prices.get(i).unwrap_or(&0.5),
+                    }
                 }).collect();
 
                 info!(
@@ -570,6 +628,7 @@ fn parse_game_time(s: &str) -> Result<i64> {
 
 // ── Alpha Engine ──────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 async fn get_model_prob(http: &Client, gs: &GameStateRequest) -> Result<f64> {
     let resp: PredictResponse = http
         .post(format!("{ALPHA_ENGINE_URL}/predict"))
@@ -581,6 +640,50 @@ async fn get_model_prob(http: &Client, gs: &GameStateRequest) -> Result<f64> {
         warn!("Alpha Engine returned naive prior (model not loaded)");
     }
     Ok(resp.win_probability)
+}
+
+/// Query server.py for the current live game state matching these team IDs.
+async fn get_live_game_state(
+    http: &Client,
+    home_team_id: i64,
+    away_team_id: i64,
+) -> Option<(i32, f64, f64, f64)> {
+    // Returns (period, game_seconds_left, home_score, away_score)
+    let resp = http.get(format!("{SERVER_URL}/games"))
+        .send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let games = data.get("games")?.as_array()?;
+
+    for game in games {
+        // Match by team IDs exposed by server.py
+        let g_home = game.get("home_team_id")?.as_i64()?;
+        let g_away = game.get("away_team_id")?.as_i64()?;
+
+        if g_home != home_team_id || g_away != away_team_id {
+            continue;
+        }
+
+        let score = game.get("score")?;
+        let period = game.get("period")?.as_i64()? as i32;
+        let home_score = score.get("home")?.as_f64()?;
+        let away_score = score.get("away")?.as_f64()?;
+
+        let game_clock = game.get("game_clock").and_then(|v| v.as_str()).unwrap_or("");
+        let game_seconds_left = {
+            let clock = game_clock.replace("PT", "").replace("S", "");
+            let parts: Vec<&str> = clock.split('M').collect();
+            let mins: f64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let secs: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let remaining_periods = (4 - period).max(0) as f64;
+            remaining_periods * 720.0 + mins * 60.0 + secs
+        };
+
+        return Some((period, game_seconds_left, home_score, away_score));
+    }
+
+    None
 }
 
 fn parse_price(v: &serde_json::Value) -> Option<f64> {
@@ -604,6 +707,10 @@ async fn run_ws_ingestion(
     let mut all_token_ids: Vec<String> = Vec::new();
 
     for m in &markets {
+        // Resolve home/away team IDs for this market
+        let home_tid = m.tokens.iter().find(|t| t.is_home).and_then(|t| t.team_id);
+        let away_tid = m.tokens.iter().find(|t| !t.is_home).and_then(|t| t.team_id);
+
         for t in &m.tokens {
             registry.insert(
                 t.token_id.clone(),
@@ -613,6 +720,8 @@ async fn run_ws_ingestion(
                     token_id:        t.token_id.clone(),
                     team_name:       t.team_name.clone(),
                     is_home:         t.is_home,
+                    home_team_id:    home_tid,
+                    away_team_id:    away_tid,
                     game_start_time: m.game_start_time.clone(),
                 },
             );
@@ -698,20 +807,48 @@ async fn run_ws_ingestion(
             // Only process home token — gives P(home wins) directly.
             if !entry.is_home { continue; }
 
+            // Resolve team IDs (required for v2 alpha-engine)
+            let home_tid = entry.home_team_id.unwrap_or(0);
+            let away_tid = entry.away_team_id.unwrap_or(0);
+
+            // Try to get live game state from server.py
+            let (period, secs_left, home_score, away_score) =
+                get_live_game_state(&http, home_tid, away_tid)
+                    .await
+                    .unwrap_or((1, 2880.0, 0.0, 0.0));
+
             let game_state = GameStateRequest {
-                period: 1, game_seconds_left: 2880.0,
-                home_score: 0.0, away_score: 0.0,
-                margin: 0.0, abs_margin: 0.0,
-                total_points: 0.0, scoring_pace: 0.0,
+                home_team_id:      home_tid,
+                away_team_id:      away_tid,
+                period,
+                game_seconds_left: secs_left,
+                home_score,
+                away_score,
             };
 
-            let model_prob = match get_model_prob(&http, &game_state).await {
-                Ok(p)  => p,
+            let resp = match http
+                .post(format!("{ALPHA_ENGINE_URL}/predict"))
+                .json(&game_state)
+                .send().await
+            {
+                Ok(r) => match r.json::<PredictResponse>().await {
+                    Ok(p)  => p,
+                    Err(e) => { warn!("Alpha Engine deserialise error: {e}"); continue; }
+                },
                 Err(e) => { warn!("Alpha Engine error: {e}"); continue; }
             };
 
+            let model_prob = resp.win_probability;
             let edge = model_prob - market_prob;
+
             if edge.abs() < EDGE_THRESHOLD { continue; }
+            if resp.edge_confidence < 0.60 {
+                info!(
+                    "Edge {edge:+.3} found but confidence too low ({:.1}%) — skipping",
+                    resp.edge_confidence * 100.0
+                );
+                continue;
+            }
 
             let action = if edge > 0.0 {
                 format!("BUY_{}", entry.team_name.to_uppercase().replace(' ', "_"))
@@ -720,8 +857,8 @@ async fn run_ws_ingestion(
             };
 
             info!(
-                "EDGE FOUND  game=\"{}\"  home={}  edge={edge:+.3}  action={action}",
-                entry.question, entry.team_name
+                "EDGE FOUND  game=\"{}\"  home={}  edge={edge:+.3}  conf={:.1}%  action={action}",
+                entry.question, entry.team_name, resp.edge_confidence * 100.0
             );
 
             // Sign the order before logging

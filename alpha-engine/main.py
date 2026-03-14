@@ -1,147 +1,187 @@
 """
-Alpha Engine — FastAPI inference server.
-Loads the trained XGBoost win-probability model and exposes it over HTTP
-so the Rust execution engine can query it.
+Alpha Engine — FastAPI v2 inference server.
+Loads the trained v2 XGBoost ensemble and FeatureEngine,
+exposes full predictions over HTTP for the Rust execution engine.
 
 Run:
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    cd /path/to/unihack && uvicorn alpha-engine.main:app --host 0.0.0.0 --port 8001 --reload
+
+Or from the alpha-engine directory:
+    cd /path/to/unihack/alpha-engine && python main.py
 """
 
-import json
 import os
+import sys
+
 import numpy as np
 import xgboost as xgb
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 
-# ── Config ──────────────────────────────────────────────────────────────────
-MODEL_DIR   = os.path.join(os.path.dirname(__file__), "..", "..", "data")
-MODEL_PATH  = os.path.join(MODEL_DIR, "win_probability_model.json")
-FEATS_PATH  = os.path.join(MODEL_DIR, "feature_columns.json")
+# ── Ensure parent dir is importable (for features.py) ────────────────────────
+PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, PROJECT_ROOT)
 
-app = FastAPI(title="NBA Alpha Engine", version="1.0.0")
+from features import FeatureEngine
 
-# ── Load model at startup ────────────────────────────────────────────────────
-model: xgb.XGBClassifier | None = None
-feature_cols: list[str] = []
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+
+
+# ══════════════════════════════════════════════
+# MODEL SUITE (v2 — 4 models)
+# ══════════════════════════════════════════════
+
+class ModelSuite:
+    """Loads and holds all v2 trained models."""
+
+    def __init__(self):
+        print("[alpha-engine] Loading v2 models...")
+        self.win_model = xgb.XGBClassifier()
+        self.win_model.load_model(f"{DATA_DIR}/v2_win_probability.json")
+
+        self.margin_model = xgb.XGBRegressor()
+        self.margin_model.load_model(f"{DATA_DIR}/v2_margin.json")
+
+        self.proxy_model = xgb.XGBClassifier()
+        self.proxy_model.load_model(f"{DATA_DIR}/v2_market_proxy.json")
+
+        self.edge_model = xgb.XGBClassifier()
+        self.edge_model.load_model(f"{DATA_DIR}/v2_edge_model.json")
+
+        print("[alpha-engine] All v2 models loaded.")
+
+    def predict(self, features, feature_engine):
+        """Run all models and return predictions."""
+        live_arr = feature_engine.to_live_array(features)
+        pregame_arr = feature_engine.to_pregame_array(features)
+
+        win_prob = float(self.win_model.predict_proba(live_arr)[0][1])
+        proxy_prob = float(self.proxy_model.predict_proba(pregame_arr)[0][1])
+        margin_pred = float(self.margin_model.predict(live_arr)[0])
+
+        edge = win_prob - proxy_prob
+        abs_edge = abs(edge)
+
+        # Edge model confidence
+        features["EDGE"] = edge
+        features["ABS_EDGE"] = abs_edge
+        features["OOF_PROXY_PROB"] = proxy_prob
+        features["OOF_LIVE_PROB"] = win_prob
+        edge_arr = feature_engine.to_edge_array(features)
+        edge_confidence = float(self.edge_model.predict_proba(edge_arr)[0][1])
+
+        # Kelly sizing
+        kelly_fraction = 0.25
+        kelly_size = max(0, min(0.2, edge_confidence * 2 - 1)) * kelly_fraction
+
+        return {
+            "win_probability": round(win_prob, 4),
+            "proxy_probability": round(proxy_prob, 4),
+            "predicted_margin": round(margin_pred, 1),
+            "edge": round(edge, 4),
+            "abs_edge": round(abs_edge, 4),
+            "edge_confidence": round(edge_confidence, 4),
+            "kelly_size": round(kelly_size, 4),
+        }
+
+
+# ══════════════════════════════════════════════
+# APP SETUP
+# ══════════════════════════════════════════════
+
+app = FastAPI(title="NBA Alpha Engine", version="2.0.0")
+
+feature_engine: FeatureEngine | None = None
+models: ModelSuite | None = None
 
 
 @app.on_event("startup")
-def load_model():
-    global model, feature_cols
-    if not os.path.exists(MODEL_PATH):
-        print(f"[alpha-engine] WARNING: model not found at {MODEL_PATH}. "
-              "Run model.py first to train it.")
-        return
-
-    model = xgb.XGBClassifier()
-    model.load_model(MODEL_PATH)
-
-    with open(FEATS_PATH) as f:
-        feature_cols = json.load(f)
-
-    print(f"[alpha-engine] Loaded model with {len(feature_cols)} features.")
+def load_models():
+    global feature_engine, models
+    # Change cwd to project root so FeatureEngine finds data/ via relative path
+    os.chdir(PROJECT_ROOT)
+    feature_engine = FeatureEngine()
+    models = ModelSuite()
 
 
 # ── Request / response schemas ───────────────────────────────────────────────
+
 class GameState(BaseModel):
     """
     Live game state snapshot sent by the Rust engine.
-    All numeric fields default to 0 so the caller only needs to
-    supply what it actually knows — the model handles the rest.
+    Now accepts team IDs so FeatureEngine can look up
+    team profiles, rolling stats, and fatigue.
     """
-    # In-game state (most important at inference time)
-    period: int             = 1
+    home_team_id: int        = 0
+    away_team_id: int        = 0
+    period: int              = 1
     game_seconds_left: float = 2880.0
-    home_score: float       = 0.0
-    away_score: float       = 0.0
-    margin: float           = 0.0
-    abs_margin: float       = 0.0
-    total_points: float     = 0.0
-    scoring_pace: float     = 0.0
-    margin_x_time: float    = 0.0
-    abs_margin_x_time: float = 0.0
-    is_q4: int              = 0
-    is_close_late: int      = 0
-    is_blowout: int         = 0
-    home_momentum_2min: float = 0.0
-    away_momentum_2min: float = 0.0
-    momentum_swing: float   = 0.0
-    max_home_lead: float    = 0.0
-    max_away_lead: float    = 0.0
-    lead_volatility: float  = 0.0
-
-    # Pre-game / season stats (optional — use 0 if unavailable live)
-    home_pace: float        = 0.0
-    away_pace: float        = 0.0
-    home_net_rating: float  = 0.0
-    away_net_rating: float  = 0.0
-    diff_net_rating: float  = 0.0
-    home_rest_days: float   = 2.0
-    away_rest_days: float   = 2.0
-    diff_rest_days: float   = 0.0
-    home_is_b2b: int        = 0
-    away_is_b2b: int        = 0
+    home_score: float        = 0.0
+    away_score: float        = 0.0
 
 
 class PredictResponse(BaseModel):
-    win_probability: float   # P(home team wins), in [0, 1]
+    win_probability: float
+    proxy_probability: float
+    predicted_margin: float
+    edge: float
+    abs_edge: float
+    edge_confidence: float
+    kelly_size: float
     model_loaded: bool
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": models is not None,
+        "feature_engine_ready": feature_engine is not None,
+        "version": "2.0",
+    }
 
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(state: GameState):
-    if model is None:
-        # No model yet → return a naive prior based on current margin
-        naive_prob = float(np.clip(0.5 + state.margin * 0.01, 0.01, 0.99))
-        return PredictResponse(win_probability=naive_prob, model_loaded=False)
+    if models is None or feature_engine is None:
+        margin = state.home_score - state.away_score
+        naive_prob = float(np.clip(0.5 + margin * 0.01, 0.01, 0.99))
+        return PredictResponse(
+            win_probability=naive_prob,
+            proxy_probability=0.5,
+            predicted_margin=0.0,
+            edge=0.0,
+            abs_edge=0.0,
+            edge_confidence=0.0,
+            kelly_size=0.0,
+            model_loaded=False,
+        )
 
-    # Build feature vector aligned with training columns
-    state_dict = state.model_dump()
-
-    # Map Pydantic snake_case → UPPER_CASE training column names
-    alias = {
-        "period":             "PERIOD",
-        "game_seconds_left":  "GAME_SECONDS_LEFT",
-        "home_score":         "HOME_SCORE",
-        "away_score":         "AWAY_SCORE",
-        "margin":             "MARGIN",
-        "abs_margin":         "ABS_MARGIN",
-        "total_points":       "TOTAL_POINTS",
-        "scoring_pace":       "SCORING_PACE",
-        "margin_x_time":      "MARGIN_X_TIME",
-        "abs_margin_x_time":  "ABS_MARGIN_X_TIME",
-        "is_q4":              "IS_Q4",
-        "is_close_late":      "IS_CLOSE_LATE",
-        "is_blowout":         "IS_BLOWOUT",
-        "home_momentum_2min": "HOME_MOMENTUM_2MIN",
-        "away_momentum_2min": "AWAY_MOMENTUM_2MIN",
-        "momentum_swing":     "MOMENTUM_SWING",
-        "max_home_lead":      "MAX_HOME_LEAD",
-        "max_away_lead":      "MAX_AWAY_LEAD",
-        "lead_volatility":    "LEAD_VOLATILITY",
-        "home_pace":          "HOME_PACE",
-        "away_pace":          "AWAY_PACE",
-        "home_net_rating":    "HOME_NET_RATING",
-        "away_net_rating":    "AWAY_NET_RATING",
-        "diff_net_rating":    "DIFF_NET_RATING",
-        "home_rest_days":     "HOME_REST_DAYS",
-        "away_rest_days":     "AWAY_REST_DAYS",
-        "diff_rest_days":     "DIFF_REST_DAYS",
-        "home_is_b2b":        "HOME_IS_B2B",
-        "away_is_b2b":        "AWAY_IS_B2B",
+    # Build full game state dict for FeatureEngine
+    game_state = {
+        "home_team_id": state.home_team_id,
+        "away_team_id": state.away_team_id,
+        "home_score": int(state.home_score),
+        "away_score": int(state.away_score),
+        "period": state.period,
+        "game_seconds_left": int(state.game_seconds_left),
+        "play_history": [(int(state.game_seconds_left),
+                          int(state.home_score),
+                          int(state.away_score))],
+        "prev_snapshot": {"margin": 0, "scoring_pace": 0},
+        "home_tricode": feature_engine.team_id_to_name.get(state.home_team_id, "HOM"),
+        "away_tricode": feature_engine.team_id_to_name.get(state.away_team_id, "AWY"),
     }
-    mapped = {alias[k]: v for k, v in state_dict.items() if k in alias}
 
-    # Fill missing features with 0
-    row = np.array([mapped.get(col, 0.0) for col in feature_cols], dtype=np.float32)
-    prob = float(model.predict_proba(row.reshape(1, -1))[0, 1])
-    prob = float(np.clip(prob, 0.01, 0.99))
+    # Build 188-feature vector and run all 4 models
+    features = feature_engine.build_feature_vector(game_state)
+    predictions = models.predict(features, feature_engine)
 
-    return PredictResponse(win_probability=prob, model_loaded=True)
+    return PredictResponse(model_loaded=True, **predictions)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
