@@ -25,10 +25,11 @@ use uuid::Uuid;
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
-const POLYMARKET_REST:   &str = "https://clob.polymarket.com";
-const POLYMARKET_WS:     &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-const ALPHA_ENGINE_URL:  &str = "http://127.0.0.1:8000";
-const DB_PATH:           &str = "../trades.sqlite";
+/// Gamma API — market/event discovery (supports tag_slug filtering).
+const GAMMA_API:        &str = "https://gamma-api.polymarket.com";
+const POLYMARKET_WS:    &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+const ALPHA_ENGINE_URL: &str = "http://127.0.0.1:8000";
+const DB_PATH:          &str = "../trades.sqlite";
 
 /// Minimum edge (model_prob - market_prob) required to trigger a shadow trade.
 const EDGE_THRESHOLD: f64 = 0.05;
@@ -36,31 +37,63 @@ const EDGE_THRESHOLD: f64 = 0.05;
 /// Simulated USDC stake per trade.
 const STAKE_USDC: f64 = 50.0;
 
-// ── Polymarket REST types ─────────────────────────────────────────────────────
+// ── Polymarket types ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct MarketsResponse {
-    data:        Vec<Market>,
-    next_cursor: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
+/// Canonical market representation used throughout the engine.
+#[derive(Debug, Clone)]
 struct Market {
-    condition_id: String,
-    question:     String,
-    #[allow(dead_code)]
-    active:       bool,
-    closed:       bool,
-    tokens:       Vec<Token>,
+    condition_id:    String,
+    /// e.g. "Grizzlies vs. Pistons"
+    question:        String,
+    /// UTC game tip-off time from Polymarket, e.g. "2026-03-14 01:00:00+00"
+    game_start_time: String,
+    tokens:          Vec<Token>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// One side of a moneyline market — maps to a specific team winning.
+#[derive(Debug, Clone)]
 struct Token {
-    token_id: String,
-    outcome:  String, // "Yes" or "No"
-    /// Snapshot price from REST — used as a fallback before WebSocket ticks arrive.
+    token_id:  String,
+    /// Team name, e.g. "Grizzlies" or "Pistons"
+    team_name: String,
+    /// NBA convention: outcomes[0] = away team, outcomes[1] = home team
+    is_home:   bool,
+    /// Last known price from REST snapshot; WebSocket ticks override this.
     #[allow(dead_code)]
-    price:    f64,
+    price:     f64,
+}
+
+// ── Gamma API types (market discovery) ───────────────────────────────────────
+
+/// Top-level event returned by the Gamma /events endpoint.
+#[derive(Debug, Deserialize)]
+struct GammaEvent {
+    #[allow(dead_code)]
+    title:   String,
+    active:  bool,
+    closed:  bool,
+    markets: Vec<GammaMarket>,
+}
+
+/// Individual market nested inside a GammaEvent.
+/// Field names are camelCase in JSON; `rename_all` handles the mapping.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaMarket {
+    question:           String,
+    condition_id:       String,
+    /// JSON-encoded string: `["token_id_away", "token_id_home"]`
+    clob_token_ids:     Option<String>,
+    /// JSON-encoded string: `["AwayTeam", "HomeTeam"]`
+    outcomes:           Option<String>,
+    /// JSON-encoded string: `["0.45", "0.55"]` — may be null
+    outcome_prices:     Option<String>,
+    /// "moneyline" | "spreads" | "totals" | "points" | etc.
+    sports_market_type: Option<String>,
+    /// UTC tip-off timestamp, e.g. "2026-03-14 01:00:00+00"
+    game_start_time:    Option<String>,
+    active:             bool,
+    closed:             bool,
 }
 
 // ── WebSocket message types ───────────────────────────────────────────────────
@@ -103,11 +136,15 @@ struct PredictResponse {
 /// Maps a Polymarket token_id → enough context to log a meaningful trade.
 #[derive(Debug, Clone)]
 struct MarketEntry {
-    condition_id: String,
-    question:     String,
+    condition_id:    String,
+    question:        String,
     #[allow(dead_code)]
-    token_id:     String,
-    outcome:      String, // "Yes" or "No"
+    token_id:        String,
+    team_name:       String,
+    /// True when this token represents the home team winning.
+    /// Market price of this token = P(home wins) directly.
+    is_home:         bool,
+    game_start_time: String,
 }
 
 // ── SQLite helpers ────────────────────────────────────────────────────────────
@@ -162,49 +199,147 @@ fn log_trade(
     Ok(())
 }
 
-// ── Polymarket: fetch live NBA markets ───────────────────────────────────────
+// ── Gamma API: fetch live NBA game moneyline markets ─────────────────────────
 
+/// Only ingest moneyline markets for games starting within the next 48 hours.
+/// This ensures we're pricing live game outcomes, not season-long futures.
 async fn fetch_nba_markets(http: &Client) -> Result<Vec<Market>> {
-    let mut nba_markets: Vec<Market> = Vec::new();
-    let mut cursor = String::new();
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    // Accept games whose tip-off is up to 48 h from now (includes tonight + tomorrow)
+    let cutoff_secs = now_secs + 48 * 3600;
+
+    let mut markets: Vec<Market> = Vec::new();
+    let mut offset = 0usize;
+    let limit = 100usize;
 
     loop {
-        let url = if cursor.is_empty() {
-            format!("{POLYMARKET_REST}/markets?limit=100&active=true")
-        } else {
-            format!("{POLYMARKET_REST}/markets?limit=100&active=true&next_cursor={cursor}")
-        };
+        let url = format!(
+            "{GAMMA_API}/events?tag_slug=nba&active=true&closed=false\
+             &limit={limit}&offset={offset}"
+        );
 
-        let resp: MarketsResponse = http
+        let events: Vec<GammaEvent> = http
             .get(&url)
             .send()
             .await
-            .context("GET /markets failed")?
+            .context("GET Gamma /events failed")?
             .json()
             .await
-            .context("deserialise /markets failed")?;
+            .context("deserialise Gamma /events failed")?;
 
-        let page_count = resp.data.len();
+        let page_len = events.len();
 
-        for m in resp.data {
-            let q = m.question.to_lowercase();
-            // Filter: active NBA game-winner markets
-            if !m.closed
-                && (q.contains("nba") || q.contains("will the") && q.contains("win"))
-                && (q.contains("win") || q.contains("champion") || q.contains("beat"))
-            {
-                nba_markets.push(m);
+        for event in events {
+            if event.closed || !event.active {
+                continue;
+            }
+
+            // Only process game events (title contains "vs.")
+            if !event.title.contains("vs.") {
+                continue;
+            }
+
+            for gm in event.markets {
+                if gm.closed || !gm.active {
+                    continue;
+                }
+
+                // Only moneyline — the straight "which team wins" market
+                if gm.sports_market_type.as_deref() != Some("moneyline") {
+                    continue;
+                }
+
+                // Gate by game start time — skip futures beyond 48 h
+                let game_start_time = gm.game_start_time.clone().unwrap_or_default();
+                if !game_start_time.is_empty() {
+                    // Parse "2026-03-14 01:00:00+00" → unix timestamp
+                    if let Ok(ts) = parse_game_time(&game_start_time) {
+                        if ts > cutoff_secs {
+                            continue; // too far in the future
+                        }
+                    }
+                }
+
+                // clobTokenIds is a JSON-encoded string
+                let token_ids: Vec<String> = match &gm.clob_token_ids {
+                    Some(s) => serde_json::from_str(s).unwrap_or_default(),
+                    None    => continue,
+                };
+                if token_ids.len() < 2 {
+                    continue;
+                }
+
+                // Outcomes: ["AwayTeam", "HomeTeam"] by NBA convention
+                let team_names: Vec<String> = match &gm.outcomes {
+                    Some(s) => serde_json::from_str(s).unwrap_or_else(|_| {
+                        vec!["Away".into(), "Home".into()]
+                    }),
+                    None => vec!["Away".into(), "Home".into()],
+                };
+
+                // Prices: parallel array to token_ids / team_names
+                let prices: Vec<f64> = match &gm.outcome_prices {
+                    Some(s) => {
+                        let raw: Vec<String> = serde_json::from_str(s).unwrap_or_default();
+                        raw.iter().map(|p| p.parse().unwrap_or(0.5)).collect()
+                    }
+                    None => vec![0.5; token_ids.len()],
+                };
+
+                // index 0 = away team, index 1 = home team
+                let tokens: Vec<Token> = token_ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, id)| Token {
+                        token_id:  id,
+                        team_name: team_names.get(i).cloned().unwrap_or_else(|| "Unknown".into()),
+                        is_home:   i == 1,
+                        price:     *prices.get(i).unwrap_or(&0.5),
+                    })
+                    .collect();
+
+                info!(
+                    "Game market: \"{}\"  start={}  away={} ({:.0}%)  home={} ({:.0}%)",
+                    gm.question,
+                    game_start_time,
+                    tokens[0].team_name, tokens[0].price * 100.0,
+                    tokens[1].team_name, tokens[1].price * 100.0,
+                );
+
+                markets.push(Market {
+                    condition_id:    gm.condition_id,
+                    question:        gm.question,
+                    game_start_time: game_start_time,
+                    tokens,
+                });
             }
         }
 
-        match resp.next_cursor {
-            Some(c) if !c.is_empty() && page_count == 100 => cursor = c,
-            _ => break,
+        if page_len < limit {
+            break;
         }
+        offset += limit;
     }
 
-    info!("Found {} NBA markets on Polymarket", nba_markets.len());
-    Ok(nba_markets)
+    info!("Found {} live NBA game moneyline markets", markets.len());
+    Ok(markets)
+}
+
+/// Parse Polymarket's game start time string to a Unix timestamp.
+/// Handles "2026-03-14 01:00:00+00" and "2026-03-14T01:00:00Z".
+fn parse_game_time(s: &str) -> Result<i64> {
+    // Normalise to RFC-3339 style and lean on chrono
+    let normalised = s
+        .replace(' ', "T")
+        .replace("+00", "+00:00");
+    let dt = chrono::DateTime::parse_from_rfc3339(&normalised)
+        .context("parse game_start_time")?;
+    Ok(dt.timestamp())
 }
 
 // ── Alpha Engine: get win probability ────────────────────────────────────────
@@ -254,10 +389,12 @@ async fn run_ws_ingestion(
             registry.insert(
                 t.token_id.clone(),
                 MarketEntry {
-                    condition_id: m.condition_id.clone(),
-                    question:     m.question.clone(),
-                    token_id:     t.token_id.clone(),
-                    outcome:      t.outcome.clone(),
+                    condition_id:    m.condition_id.clone(),
+                    question:        m.question.clone(),
+                    token_id:        t.token_id.clone(),
+                    team_name:       t.team_name.clone(),
+                    is_home:         t.is_home,
+                    game_start_time: m.game_start_time.clone(),
                 },
             );
             all_token_ids.push(t.token_id.clone());
@@ -361,19 +498,20 @@ async fn run_ws_ingestion(
             };
 
             info!(
-                "Tick  market=\"{}\"  outcome={}  market_prob={:.3}",
-                entry.question, entry.outcome, market_prob
+                "Tick  game=\"{}\"  team={}  is_home={}  market_prob={:.3}  start={}",
+                entry.question, entry.team_name, entry.is_home,
+                market_prob, entry.game_start_time
             );
 
-            // We model P(home wins). Map YES token → home win probability.
-            // Polymarket questions are typically "Will [HOME TEAM] win?"
-            // so YES.price ≈ P(home wins).
-            if entry.outcome.to_lowercase() != "yes" {
-                continue; // use the YES side as our reference
+            // Only use the HOME team token to get P(home wins) directly.
+            // The away token price = 1 - P(home wins), which is redundant.
+            if !entry.is_home {
+                continue;
             }
 
-            // Build a minimal game-state for the alpha engine.
-            // With no live PBP data yet we use a pre-game snapshot (all zeros).
+            // market_prob is now P(home team wins) from the market.
+            // Build a pre-game snapshot for the Alpha Engine.
+            // When live PBP is wired up this will carry real in-game state.
             let game_state = GameStateRequest {
                 period:            1,
                 game_seconds_left: 2880.0,
@@ -389,7 +527,6 @@ async fn run_ws_ingestion(
                 Ok(p)  => p,
                 Err(e) => {
                     warn!("Alpha Engine error: {e}");
-                    // Fallback: skip trade rather than log garbage
                     continue;
                 }
             };
@@ -397,15 +534,20 @@ async fn run_ws_ingestion(
             let edge = model_prob - market_prob;
 
             if edge.abs() < EDGE_THRESHOLD {
-                continue; // No mispricing worth trading
+                continue; // no meaningful mispricing
             }
 
-            // Determine action
-            let action = if edge > 0.0 { "BUY_YES" } else { "BUY_NO" };
+            // Positive edge → market underprices home team → BUY home token
+            // Negative edge → market overprices home team → BUY away token
+            let action = if edge > 0.0 {
+                format!("BUY_{}", entry.team_name.to_uppercase().replace(' ', "_"))
+            } else {
+                "BUY_AWAY".to_string()
+            };
 
             info!(
-                "EDGE FOUND  question=\"{}\"  edge={edge:.3}  action={action}",
-                entry.question
+                "EDGE FOUND  game=\"{}\"  home={}  edge={edge:+.3}  action={action}",
+                entry.question, entry.team_name
             );
 
             // Log shadow trade
@@ -414,7 +556,7 @@ async fn run_ws_ingestion(
                 &db_guard,
                 &entry.condition_id,
                 &entry.question,
-                action,
+                &action,
                 market_prob,
                 model_prob,
             ) {
