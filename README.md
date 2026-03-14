@@ -1,6 +1,18 @@
 # NBA Shadow Trader
 
-Four services, one command each. Run them in order.
+Quantitative prediction market engine — real-time NBA model vs. Polymarket odds with testnet order signing.
+
+## Quick start
+
+```bash
+./start.sh              # launches all 4 services
+open http://localhost:3000  # open the dashboard
+./start.sh --stop       # shut everything down
+```
+
+Logs are written to `./logs/`. For manual per-service startup, see below.
+
+---
 
 ## Prerequisites
 
