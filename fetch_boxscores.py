@@ -97,11 +97,15 @@ def fetch_game_boxscore(game_id):
             pdata.append({
                 "mins": mins,
                 "pm": float(ps.get("plusMinusPoints", 0) or 0),
+                "pts": float(ps.get("points", 0) or 0),
+                "fouls": float(ps.get("foulsPersonal", 0) or 0),
             })
 
         if not pdata:
             result[f"{side}_STAR_PM"] = 0
             result[f"{side}_STAR_MINS_TOTAL"] = 0
+            result[f"{side}_STAR_PTS"] = 0
+            result[f"{side}_STAR_FOULS"] = 0
             result[f"{side}_LINEUP_PM"] = 0
             continue
 
@@ -109,6 +113,8 @@ def fetch_game_boxscore(game_id):
         star = max(pdata, key=lambda x: x["mins"])
         result[f"{side}_STAR_PM"] = star["pm"]
         result[f"{side}_STAR_MINS_TOTAL"] = star["mins"]
+        result[f"{side}_STAR_PTS"] = star["pts"]
+        result[f"{side}_STAR_FOULS"] = star["fouls"]
 
         # Lineup PM = sum of top-5-by-minutes players' plus/minus
         by_mins = sorted(pdata, key=lambda x: x["mins"], reverse=True)
@@ -125,13 +131,18 @@ def main():
     print(f"Total games in training data: {len(game_ids)}")
 
     # Load any previously fetched data (resume support)
+    REQUIRED_COLS = {"HOME_STAR_PTS", "HOME_STAR_FOULS"}
     existing = set()
     rows = []
     if os.path.exists(OUTPUT_PATH):
         prev = pd.read_parquet(OUTPUT_PATH)
-        existing = set(prev["GAME_ID"].values)
-        rows = prev.to_dict("records")
-        print(f"Resuming: {len(existing)} games already fetched")
+        if not REQUIRED_COLS.issubset(prev.columns):
+            print("Existing parquet missing new columns (STAR_PTS/STAR_FOULS) — re-fetching all games.")
+            os.remove(OUTPUT_PATH)
+        else:
+            existing = set(prev["GAME_ID"].values)
+            rows = prev.to_dict("records")
+            print(f"Resuming: {len(existing)} games already fetched")
 
     remaining = [gid for gid in game_ids if gid not in existing]
     print(f"Games to fetch: {len(remaining)}")

@@ -435,7 +435,9 @@ def _compute_game_boxscore(game_pbp, home_id, away_id, snap_times):
             feats[f"LIVE_{side}_HOT_SHOOTERS"] = hot
             feats[f"LIVE_{side}_COLD_SHOOTERS"] = cold
 
-            # Star player = highest-FGA player on team
+            # Star player fallback from PBP: highest-FGA player.
+            # For games with boxscore data, this is overwritten by the
+            # boxscore overlay (highest-minutes, matching server.py inference).
             star_key = None
             max_fga = 0
             for (t, p), ps in player_stats.items():
@@ -688,6 +690,9 @@ def overlay_historical_boxscore(snapshots, boxscore_adv, games):
         ("PTS_2ND",       "PTS_2ND"),
         ("PTS_OFF_TO",    "PTS_OFF_TO"),
         ("BENCH_PTS",     "BENCH_PTS"),
+        # Star player (highest-minutes) — aligns training with server.py inference
+        ("STAR_PTS",      "STAR_PTS"),
+        ("STAR_FOULS",    "STAR_FOULS"),
     ]
     # These scale with game progress but are rate-like (noisier)
     rate_maps = [

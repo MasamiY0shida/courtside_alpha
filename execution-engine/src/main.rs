@@ -1122,7 +1122,26 @@ async fn run_ws_ingestion(
                 {
                     (sp.win_probability, sp.game_seconds_left, sp.edge_confidence)
                 } else {
-                    // Alpha-engine fallback (limited feature set)
+                    // Alpha-engine fallback sends pregame state (scores=0).
+                    // This is only valid before the game starts — for live games it
+                    // produces nonsense predictions.  Skip rather than trade blind.
+                    let game_started = if !entry.game_start_time.is_empty() {
+                        parse_game_time(&entry.game_start_time)
+                            .map(|ts| ts < Utc::now().timestamp())
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if game_started {
+                        warn!(
+                            "server.py unavailable for live game \"{}\" — \
+                             skipping to avoid stale pregame prediction",
+                            entry.question
+                        );
+                        continue;
+                    }
+
+                    // Alpha-engine fallback — pregame markets only
                     let game_state = GameStateRequest {
                         home_team_id: home_tid, away_team_id: away_tid,
                         period: 1, game_seconds_left: 2880.0,

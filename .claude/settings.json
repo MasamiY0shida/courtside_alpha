@@ -18,7 +18,9 @@
       "Bash(curl -s --max-time 10 \"https://cdn.nba.com/stats/scores/leagueSchedule.json\" -H \"User-Agent: Mozilla/5.0\")",
       "Bash(curl -s --max-time 15 \"https://nba-prod-us-east-1-mediaops-stats.s3.amazonaws.com/NBA/liveData/boxscore/boxscore_0022500001.json\")",
       "Bash(python -c \"import pandas as pd; df = pd.read_parquet\\(''data/play_by_play.parquet''\\); print\\(f''PBP games: {df[\"\"GAME_ID\"\"].nunique\\(\\)}''\\); print\\(f''PBP rows: {len\\(df\\)}''\\)\")",
-      "Bash(python -c \"import pandas as pd; df = pd.read_parquet\\(''data/play_by_play.parquet''\\); print\\(''Columns:'', list\\(df.columns\\)[:30]\\); print\\(''Sample GAME_ID:'', df[''GAME_ID''].iloc[0]\\)\")"
+      "Bash(python -c \"import pandas as pd; df = pd.read_parquet\\(''data/play_by_play.parquet''\\); print\\(''Columns:'', list\\(df.columns\\)[:30]\\); print\\(''Sample GAME_ID:'', df[''GAME_ID''].iloc[0]\\)\")",
+      "Bash(cargo build:*)",
+      "Bash(~/.cargo/bin/cargo build:*)"
     ]
   }
 }
