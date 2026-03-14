@@ -10,9 +10,11 @@
 //    5. All trades land in SQLite `simulated_trades` table
 // ============================================================================
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::{extract::State, routing::get, Json, Router};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -20,6 +22,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -147,6 +150,32 @@ struct MarketEntry {
     game_start_time: String,
 }
 
+// ── HTTP API types ────────────────────────────────────────────────────────────
+
+/// Row returned by GET /trades.
+#[derive(Serialize)]
+struct SimulatedTrade {
+    id:                  String,
+    timestamp:           String,
+    game_id:             String,
+    target_team:         String,
+    action:              String,
+    market_implied_prob: f64,
+    model_implied_prob:  f64,
+    stake_amount:        f64,
+    status:              String,
+    pnl:                 Option<f64>,
+}
+
+/// Gamma API response for a single market (used by settlement).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaMarketDetail {
+    closed:         bool,
+    active:         bool,
+    outcome_prices: Option<String>,
+}
+
 // ── SQLite helpers ────────────────────────────────────────────────────────────
 
 fn init_db(conn: &Connection) -> Result<()> {
@@ -197,6 +226,155 @@ fn log_trade(
         model_prob - market_prob
     );
     Ok(())
+}
+
+// ── HTTP API server ───────────────────────────────────────────────────────────
+
+async fn handle_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "ok"}))
+}
+
+async fn handle_get_trades(
+    State(db): State<Arc<Mutex<Connection>>>,
+) -> Json<Vec<SimulatedTrade>> {
+    let conn = db.lock().await;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, timestamp, game_id, target_team, action, \
+             market_implied_prob, model_implied_prob, stake_amount, status, pnl \
+             FROM simulated_trades ORDER BY timestamp DESC",
+        )
+        .unwrap();
+
+    let trades: Vec<SimulatedTrade> = stmt
+        .query_map([], |row| {
+            Ok(SimulatedTrade {
+                id:                  row.get(0)?,
+                timestamp:           row.get(1)?,
+                game_id:             row.get(2)?,
+                target_team:         row.get(3)?,
+                action:              row.get(4)?,
+                market_implied_prob: row.get(5)?,
+                model_implied_prob:  row.get(6)?,
+                stake_amount:        row.get(7)?,
+                status:              row.get(8)?,
+                pnl:                 row.get(9)?,
+            })
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Json(trades)
+}
+
+async fn run_http_server(db: Arc<Mutex<Connection>>) -> Result<()> {
+    let app = Router::new()
+        .route("/health", get(handle_health))
+        .route("/trades", get(handle_get_trades))
+        .layer(CorsLayer::permissive())
+        .with_state(db);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
+    info!("HTTP server listening on {addr}");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// ── Trade settlement ──────────────────────────────────────────────────────────
+
+/// Query the Gamma API for a single market's resolution status.
+/// Returns Some(true) if home team won, Some(false) if away team won, None if unresolved.
+async fn check_market_resolution(http: &Client, condition_id: &str) -> Option<bool> {
+    let url = format!("{GAMMA_API}/markets/{condition_id}");
+    let resp = http.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let market: GammaMarketDetail = resp.json().await.ok()?;
+    if !market.closed || market.active {
+        return None; // not yet resolved
+    }
+    // outcome_prices: ["away_price", "home_price"] — winner has price "1"
+    let prices_str = market.outcome_prices?;
+    let prices: Vec<String> = serde_json::from_str(&prices_str).ok()?;
+    let home_price: f64 = prices.get(1)?.parse().ok()?;
+    Some(home_price > 0.99)
+}
+
+/// Background task: every 5 minutes, check open trades and settle resolved markets.
+async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+
+        // Collect open trades (release lock immediately after)
+        let open_trades: Vec<(String, String, f64, String)> = {
+            let conn = db.lock().await;
+            let mut stmt = match conn.prepare(
+                "SELECT id, game_id, market_implied_prob, action \
+                 FROM simulated_trades WHERE status = 'OPEN'",
+            ) {
+                Ok(s) => s,
+                Err(e) => { error!("settle query prepare failed: {e}"); continue; }
+            };
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+
+        if open_trades.is_empty() {
+            continue;
+        }
+
+        // Cache resolution results per game_id to avoid duplicate API calls
+        let mut resolved: std::collections::HashMap<String, Option<bool>> =
+            std::collections::HashMap::new();
+
+        for (trade_id, game_id, market_prob, action) in &open_trades {
+            let home_won = if let Some(&cached) = resolved.get(game_id) {
+                cached
+            } else {
+                let result = check_market_resolution(&http, game_id).await;
+                resolved.insert(game_id.clone(), result);
+                result
+            };
+
+            let home_won = match home_won {
+                Some(v) => v,
+                None => continue, // market not yet resolved
+            };
+
+            // Determine outcome: "BUY_AWAY" backs away team; everything else backs home
+            let won = if action == "BUY_AWAY" { !home_won } else { home_won };
+
+            let (status, pnl) = if won {
+                ("WON", STAKE_USDC * (1.0 / market_prob - 1.0))
+            } else {
+                ("LOST", -STAKE_USDC)
+            };
+
+            let conn = db.lock().await;
+            match conn.execute(
+                "UPDATE simulated_trades SET status = ?1, pnl = ?2 WHERE id = ?3",
+                params![status, pnl, trade_id],
+            ) {
+                Ok(_) => info!(
+                    "Trade settled  id={trade_id}  status={status}  pnl={pnl:.2} USDC"
+                ),
+                Err(e) => error!("settle update failed for {trade_id}: {e}"),
+            }
+        }
+    }
 }
 
 // ── Gamma API: fetch live NBA game moneyline markets ─────────────────────────
@@ -594,6 +772,25 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
+    // ── Spawn HTTP API server (port 4000) — serves /trades and /health
+    {
+        let db_http = Arc::clone(&db);
+        tokio::spawn(async move {
+            if let Err(e) = run_http_server(db_http).await {
+                error!("HTTP server error: {e}");
+            }
+        });
+    }
+
+    // ── Spawn trade settlement background task (runs every 5 min)
+    {
+        let db_settle = Arc::clone(&db);
+        let http_settle = http.clone();
+        tokio::spawn(async move {
+            settle_trades(db_settle, http_settle).await;
+        });
+    }
+
     // ── Check Alpha Engine health
     match http
         .get(format!("{ALPHA_ENGINE_URL}/health"))
@@ -608,25 +805,24 @@ async fn main() -> Result<()> {
         Err(e) => warn!("Alpha Engine unreachable ({e}). Trades will use naive prior."),
     }
 
-    // ── Discover NBA markets
-    let markets = fetch_nba_markets(&http).await?;
-
-    if markets.is_empty() {
-        warn!("No active NBA markets on Polymarket right now. \
-               The engine will retry in 60 s…");
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        // In production: loop and retry. For MVP we exit and let the operator restart.
-        return Ok(());
-    }
-
-    // ── Launch WebSocket ingestion loop
-    // Reconnects automatically on drop — in production wrap in a retry loop.
+    // ── Discover NBA markets and run WebSocket ingestion — retry indefinitely
     loop {
+        let markets = fetch_nba_markets(&http).await.unwrap_or_else(|e| {
+            error!("Market discovery failed: {e}");
+            vec![]
+        });
+
+        if markets.is_empty() {
+            warn!("No active NBA markets on Polymarket right now — retrying in 60 s…");
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            continue;
+        }
+
         info!("(Re)connecting WebSocket ingestion loop…");
-        match run_ws_ingestion(markets.clone(), http.clone(), Arc::clone(&db)).await {
+        match run_ws_ingestion(markets, http.clone(), Arc::clone(&db)).await {
             Ok(_)  => warn!("WS loop exited cleanly — reconnecting in 5 s"),
             Err(e) => error!("WS loop error: {e} — reconnecting in 5 s"),
         }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }

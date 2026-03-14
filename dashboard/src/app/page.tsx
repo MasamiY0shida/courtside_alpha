@@ -91,7 +91,7 @@ export default function Dashboard() {
                     <td className="p-3 text-gray-400">{new Date(t.timestamp).toLocaleTimeString()}</td>
                     <td className="p-3 max-w-xs truncate">{t.target_team}</td>
                     <td className="p-3">
-                      <span className={t.action === "BUY_YES" ? "text-green-400" : "text-red-400"}>
+                      <span className={t.action !== "BUY_AWAY" ? "text-green-400" : "text-red-400"}>
                         {t.action}
                       </span>
                     </td>
