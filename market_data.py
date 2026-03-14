@@ -272,14 +272,43 @@ def fetch_polymarket_game_odds():
             if is_moneyline and volume > 1000:
                 team1, team2 = parse_teams_from_question(question)
                 if team1 and team2:
+                    # Use outcomes array to match each team name to its price.
+                    # Polymarket orders outcomes as listed in the question ("Away vs. Home"),
+                    # so prices[0]/prices[1] don't reliably map to team1/team2 (which are
+                    # returned in TEAM_ALIASES dict order, not question order).
+                    outcomes_raw = m.get("outcomes", "[]")
+                    if isinstance(outcomes_raw, str):
+                        try:
+                            outcomes_raw = json.loads(outcomes_raw)
+                        except Exception:
+                            outcomes_raw = []
+                    outcomes_list = outcomes_raw if isinstance(outcomes_raw, list) else []
+
+                    # Default fallback (pre-fix behaviour)
+                    team1_prob = float(prices[0])
+                    team2_prob = float(prices[1]) if len(prices) > 1 else 1 - float(prices[0])
+
+                    # Override with name-matched probabilities when outcomes are available
+                    for i, outcome_name in enumerate(outcomes_list):
+                        if i >= len(prices):
+                            break
+                        oname = outcome_name.lower()
+                        for alias, info in TEAM_ALIASES.items():
+                            if alias in oname:
+                                if info["team_id"] == team1["team_id"]:
+                                    team1_prob = float(prices[i])
+                                elif info["team_id"] == team2["team_id"]:
+                                    team2_prob = float(prices[i])
+                                break
+
                     game_key = f"{team1['tricode']}_vs_{team2['tricode']}"
                     game_odds[game_key] = {
                         "home_team": team1["tricode"],
                         "away_team": team2["tricode"],
                         "home_team_id": team1["team_id"],
                         "away_team_id": team2["team_id"],
-                        "home_win_prob": float(prices[0]),
-                        "away_win_prob": float(prices[1]) if len(prices) > 1 else 1 - float(prices[0]),
+                        "home_win_prob": team1_prob,
+                        "away_win_prob": team2_prob,
                         "volume": volume,
                         "market_id": m.get("id", ""),
                         "event_title": title,

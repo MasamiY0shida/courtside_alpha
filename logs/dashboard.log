@@ -7,7 +7,8 @@
 - Network:       http://10.20.77.10:3000
 
 ✓ Starting...
-✓ Ready in 461ms
- GET / 200 in 487ms (compile: 386ms, render: 101ms)
-(node:4968) [DEP0060] DeprecationWarning: The `util._extend` API is deprecated. Please use Object.assign() instead.
+✓ Ready in 429ms
+ GET / 200 in 524ms (compile: 416ms, render: 108ms)
+(node:25218) [DEP0060] DeprecationWarning: The `util._extend` API is deprecated. Please use Object.assign() instead.
 (Use `node --trace-deprecation ...` to show where the warning was created)
+ GET / 200 in 29ms (compile: 6ms, render: 23ms)
