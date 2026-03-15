@@ -118,8 +118,10 @@ export default function Dashboard() {
   }, []);
 
   // ── Derived stats ──
-  const won         = trades.filter(t => t.status === "WON").length;
-  const lost        = trades.filter(t => t.status === "LOST").length;
+  const isWon  = (t: Trade) => t.status === "WON"  || (t.status === "CLOSED" && (t.pnl ?? 0) > 0);
+  const isLost = (t: Trade) => t.status === "LOST" || (t.status === "CLOSED" && (t.pnl ?? 0) <= 0);
+  const won         = trades.filter(isWon).length;
+  const lost        = trades.filter(isLost).length;
   const open        = trades.filter(t => t.status === "OPEN").length;
   const resolved    = won + lost;
   const winRate     = resolved > 0 ? (won / resolved) * 100 : 0;
@@ -135,11 +137,11 @@ export default function Dashboard() {
   const avgStake = trades.length > 0 ? totalStaked / trades.length : null;
 
   // Current streak (trades assumed newest-first from API)
-  const resolvedOrdered = trades.filter(t => t.status === "WON" || t.status === "LOST");
+  const resolvedOrdered = trades.filter(t => t.status === "WON" || t.status === "LOST" || t.status === "CLOSED");
   let streakCount = 0;
   let streakType: "W" | "L" | null = null;
   for (const t of resolvedOrdered) {
-    const s = t.status === "WON" ? "W" : "L";
+    const s = isWon(t) ? "W" : "L";
     if (streakType === null) { streakType = s; streakCount = 1; }
     else if (s === streakType) { streakCount++; }
     else break;
@@ -151,15 +153,15 @@ export default function Dashboard() {
   const worstTrade = resolvedWithPnl.length > 0 ? resolvedWithPnl.reduce((w, t) => t.pnl! < w.pnl! ? t : w) : null;
 
   // PnL split by outcome
-  const wonPnl  = trades.filter(t => t.status === "WON").reduce((s, t) => s + (t.pnl ?? 0), 0);
-  const lostPnl = trades.filter(t => t.status === "LOST").reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const wonPnl  = trades.filter(isWon).reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const lostPnl = trades.filter(isLost).reduce((s, t) => s + (t.pnl ?? 0), 0);
 
   // Win rate by action type
-  const buyHomeTrades  = trades.filter(t => t.action !== "BUY_AWAY" && (t.status === "WON" || t.status === "LOST"));
-  const buyHomeWins    = buyHomeTrades.filter(t => t.status === "WON").length;
+  const buyHomeTrades  = trades.filter(t => t.action !== "BUY_AWAY" && (t.status === "WON" || t.status === "LOST" || t.status === "CLOSED"));
+  const buyHomeWins    = buyHomeTrades.filter(isWon).length;
   const buyHomeWinRate = buyHomeTrades.length > 0 ? (buyHomeWins / buyHomeTrades.length) * 100 : null;
-  const buyAwayTrades  = trades.filter(t => t.action === "BUY_AWAY" && (t.status === "WON" || t.status === "LOST"));
-  const buyAwayWins    = buyAwayTrades.filter(t => t.status === "WON").length;
+  const buyAwayTrades  = trades.filter(t => t.action === "BUY_AWAY" && (t.status === "WON" || t.status === "LOST" || t.status === "CLOSED"));
+  const buyAwayWins    = buyAwayTrades.filter(isWon).length;
   const buyAwayWinRate = buyAwayTrades.length > 0 ? (buyAwayWins / buyAwayTrades.length) * 100 : null;
 
   // Most targeted team
@@ -995,9 +997,10 @@ function ActionWinRateCard({ action, winRate, count, wins }: {
 
 function StatusBadge({ status }: { status: string }) {
   const styles: Record<string, string> = {
-    OPEN: "bg-yellow-900/50 text-yellow-300 border border-yellow-800/50",
-    WON:  "bg-green-900/50  text-green-300  border border-green-800/50",
-    LOST: "bg-red-900/50    text-red-300    border border-red-800/50",
+    OPEN:   "bg-yellow-900/50 text-yellow-300 border border-yellow-800/50",
+    WON:    "bg-green-900/50  text-green-300  border border-green-800/50",
+    LOST:   "bg-red-900/50    text-red-300    border border-red-800/50",
+    CLOSED: "bg-gray-800/50   text-gray-300   border border-gray-700/50",
   };
   return (
     <span className={`px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap ${styles[status] ?? "bg-gray-700 text-gray-300"}`}>
