@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title:       "NBA Shadow Trader",
+  title:       "Courtside Alpha",
   description: "Real-time quant trading dashboard for NBA prediction markets",
 };
 

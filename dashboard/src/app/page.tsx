@@ -335,7 +335,7 @@ export default function Dashboard() {
       <div className="sticky top-0 z-10 border-b border-gray-800 bg-gray-950/90 backdrop-blur">
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div>
-            <h1 className="text-lg font-bold text-green-400 tracking-widest">NBA SHADOW TRADER</h1>
+            <h1 className="text-lg font-bold text-green-400 tracking-widest">COURTSIDE ALPHA</h1>
             <p className="text-xs text-gray-600 mt-0.5">Quantitative prediction market engine · testnet order signing</p>
           </div>
           <div className="flex items-center gap-4 text-xs">

@@ -1,4 +1,4 @@
-# NBA Shadow Trader
+# Courtside Alpha
 
 Quantitative prediction market engine — real-time NBA model vs. Polymarket odds with testnet order signing.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-#  NBA Shadow Trader — one-command launcher
+#  Courtside Alpha — one-command launcher
 #  Usage:  ./start.sh          (starts all 4 services)
 #          ./start.sh --stop   (kills all 4 services)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,8 +68,8 @@ mkdir -p "$ROOT/logs"
 
 # ── Launch services ──────────────────────────────────────────────────────────
 echo ""
-echo "  NBA Shadow Trader"
-echo "  ─────────────────"
+echo "  Courtside Alpha"
+echo "  ───────────────"
 echo ""
 
 # 1. Live Game Server (port 8000)
