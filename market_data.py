@@ -473,18 +473,34 @@ def parse_teams_from_question(question):
     Extract home and away teams from a market question.
     e.g. 'Will the Lakers beat the Celtics?' -> (LAL, BOS)
     e.g. 'Clippers vs. Bulls' -> (LAC, CHI)  (first team = home typically)
+
+    Returns teams in order they appear in the question so that prices[0]/prices[1]
+    align correctly when outcomes matching is unavailable.
     """
     q = question.lower()
     found_teams = []
 
     for alias, info in TEAM_ALIASES.items():
-        if alias in q:
-            found_teams.append(info)
+        pos = q.find(alias)
+        if pos != -1:
+            found_teams.append((pos, info))
 
-    if len(found_teams) >= 2:
-        return found_teams[0], found_teams[1]
-    elif len(found_teams) == 1:
-        return found_teams[0], None
+    # Sort by position in question so team order matches Polymarket's outcomes order
+    found_teams.sort(key=lambda x: x[0])
+
+    teams = [info for _, info in found_teams]
+    # Deduplicate (e.g. "mavericks" and "mavs" both match — keep first occurrence)
+    seen_ids = set()
+    deduped = []
+    for t in teams:
+        if t["team_id"] not in seen_ids:
+            seen_ids.add(t["team_id"])
+            deduped.append(t)
+
+    if len(deduped) >= 2:
+        return deduped[0], deduped[1]
+    elif len(deduped) == 1:
+        return deduped[0], None
     return None, None
 
 

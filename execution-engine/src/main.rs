@@ -600,10 +600,10 @@ async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
 
-        let open_trades: Vec<(String, String, f64, String, f64)> = {
+        let open_trades: Vec<(String, String, f64, String, f64, f64)> = {
             let conn = db.lock().await;
             let mut stmt = match conn.prepare(
-                "SELECT id, game_id, market_implied_prob, action, stake_amount \
+                "SELECT id, game_id, market_implied_prob, action, stake_amount, model_implied_prob \
                  FROM simulated_trades WHERE status = 'OPEN'",
             ) {
                 Ok(s)  => s,
@@ -616,6 +616,7 @@ async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
                     row.get::<_, f64>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, f64>(4)?,
+                    row.get::<_, f64>(5)?,
                 ))
             })
             .unwrap()
@@ -630,7 +631,7 @@ async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
         let mut resolved: std::collections::HashMap<String, Option<bool>> =
             std::collections::HashMap::new();
 
-        for (trade_id, game_id, market_prob, action, stake_amount) in &open_trades {
+        for (trade_id, game_id, market_prob, action, stake_amount, model_prob_entry) in &open_trades {
             let home_won = if let Some(&cached) = resolved.get(game_id) {
                 cached
             } else {
@@ -644,7 +645,11 @@ async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
                 None    => continue,
             };
 
-            let won = if action == "BUY_AWAY" { !home_won } else { home_won };
+            // Reconstruct which side we hold: both probs are in home-win perspective,
+            // so model > market ↔ bought home. Actions use team names ("BUY_LAKERS"),
+            // never "BUY_AWAY", so we can't rely on the action string for this.
+            let bought_home = model_prob_entry > market_prob;
+            let won = if bought_home { home_won } else { !home_won };
 
             let (status, pnl) = if won {
                 ("WON", stake_amount * (1.0 / market_prob - 1.0))
