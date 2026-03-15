@@ -28,7 +28,8 @@
       "Bash(sqlite3 /Users/masamiyoshida/Documents/unihack/trades.sqlite \"SELECT COUNT\\(*\\) FROM trades;\")",
       "Bash(sqlite3 /Users/masamiyoshida/Documents/unihack/trades.sqlite \"SELECT COUNT\\(*\\) FROM simulated_trades; SELECT * FROM simulated_trades LIMIT 3;\")",
       "Bash(git pull:*)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "Bash(kill 38100 44515 62859 50865)"
     ]
   }
 }

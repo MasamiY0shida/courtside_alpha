@@ -314,6 +314,8 @@ struct SimulatedTrade {
     order_hash:          Option<String>,
     /// 65-byte EIP-712 signature ("0x…") — null for legacy rows.
     signed_tx:           Option<String>,
+    /// True if we hold the home team outcome. Dashboard flips display when false.
+    bought_home:         Option<bool>,
 }
 
 /// Response for GET /wallet.
@@ -360,8 +362,9 @@ fn init_db(conn: &Connection) -> Result<()> {
         );",
     )?;
     // Migrate existing databases that predate the signing columns
-    let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN order_hash TEXT", []);
-    let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN signed_tx  TEXT", []);
+    let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN order_hash  TEXT",    []);
+    let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN signed_tx   TEXT",    []);
+    let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN bought_home INTEGER", []);
     info!("SQLite ready at {DB_PATH}");
     Ok(())
 }
@@ -403,6 +406,7 @@ fn log_trade(
     action:       &str,
     market_prob:  f64,
     model_prob:   f64,
+    bought_home:  bool,
     signed_order: Option<&wallet::SignedOrder>,
 ) -> Result<()> {
     let id        = Uuid::new_v4().to_string();
@@ -411,16 +415,23 @@ fn log_trade(
     let order_hash: Option<String> = signed_order.map(|s| s.order_hash.clone());
     let signed_tx:  Option<String> = signed_order.map(|s| s.signed_tx.clone());
 
+    // Ensure bought_home column exists (idempotent migration)
+    let _ = conn.execute(
+        "ALTER TABLE simulated_trades ADD COLUMN bought_home INTEGER",
+        [],
+    );
+
+    // Probs stored as raw P(home wins) for reconstruction; display layer flips for away.
     conn.execute(
         "INSERT INTO simulated_trades
             (id, timestamp, game_id, target_team, action,
              market_implied_prob, model_implied_prob, stake_amount, status, pnl,
-             order_hash, signed_tx)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'OPEN', NULL, ?9, ?10)",
+             order_hash, signed_tx, bought_home)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'OPEN', NULL, ?9, ?10, ?11)",
         params![
             id, timestamp, game_id, target_team, action,
             market_prob, model_prob, STAKE_USDC,
-            order_hash, signed_tx
+            order_hash, signed_tx, bought_home as i64
         ],
     )?;
 
@@ -452,6 +463,7 @@ fn log_sell_trade(
     entry_price:  f64,
     exit_price:   f64,
     model_prob:   f64,
+    bought_home:  bool,
     signed_order: Option<&wallet::SignedOrder>,
 ) -> Result<()> {
     let id        = Uuid::new_v4().to_string();
@@ -473,12 +485,12 @@ fn log_sell_trade(
         "INSERT INTO simulated_trades
             (id, timestamp, game_id, target_team, action,
              market_implied_prob, model_implied_prob, stake_amount, status, pnl,
-             order_hash, signed_tx)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'CLOSED', ?9, ?10, ?11)",
+             order_hash, signed_tx, bought_home)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'CLOSED', ?9, ?10, ?11, ?12)",
         params![
             id, timestamp, game_id, target_team, action,
             exit_price, model_prob, STAKE_USDC, pnl,
-            order_hash, signed_tx
+            order_hash, signed_tx, bought_home as i64
         ],
     )?;
 
@@ -511,7 +523,7 @@ async fn handle_get_trades(
         .prepare(
             "SELECT id, timestamp, game_id, target_team, action, \
              market_implied_prob, model_implied_prob, stake_amount, status, pnl, \
-             order_hash, signed_tx \
+             order_hash, signed_tx, bought_home \
              FROM simulated_trades ORDER BY timestamp DESC",
         )
         .unwrap();
@@ -531,6 +543,7 @@ async fn handle_get_trades(
                 pnl:                 row.get(9)?,
                 order_hash:          row.get(10)?,
                 signed_tx:           row.get(11)?,
+                bought_home:         row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v != 0),
             })
         })
         .unwrap()
@@ -600,10 +613,11 @@ async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
 
-        let open_trades: Vec<(String, String, f64, String, f64, f64)> = {
+        let open_trades: Vec<(String, String, f64, String, f64, f64, bool)> = {
             let conn = db.lock().await;
             let mut stmt = match conn.prepare(
-                "SELECT id, game_id, market_implied_prob, action, stake_amount, model_implied_prob \
+                "SELECT id, game_id, market_implied_prob, action, stake_amount, model_implied_prob, \
+                        COALESCE(bought_home, CASE WHEN model_implied_prob > market_implied_prob THEN 1 ELSE 0 END) \
                  FROM simulated_trades WHERE status = 'OPEN'",
             ) {
                 Ok(s)  => s,
@@ -617,6 +631,7 @@ async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
                     row.get::<_, String>(3)?,
                     row.get::<_, f64>(4)?,
                     row.get::<_, f64>(5)?,
+                    row.get::<_, i64>(6).map(|v| v != 0).unwrap_or(true),
                 ))
             })
             .unwrap()
@@ -631,7 +646,7 @@ async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
         let mut resolved: std::collections::HashMap<String, Option<bool>> =
             std::collections::HashMap::new();
 
-        for (trade_id, game_id, market_prob, action, stake_amount, model_prob_entry) in &open_trades {
+        for (trade_id, game_id, market_prob, action, stake_amount, _model_prob, bought_home) in &open_trades {
             let home_won = if let Some(&cached) = resolved.get(game_id) {
                 cached
             } else {
@@ -645,11 +660,7 @@ async fn settle_trades(db: Arc<Mutex<Connection>>, http: Client) {
                 None    => continue,
             };
 
-            // Reconstruct which side we hold: both probs are in home-win perspective,
-            // so model > market ↔ bought home. Actions use team names ("BUY_LAKERS"),
-            // never "BUY_AWAY", so we can't rely on the action string for this.
-            let bought_home = model_prob_entry > market_prob;
-            let won = if bought_home { home_won } else { !home_won };
+            let won = if *bought_home { home_won } else { !home_won };
 
             let (status, pnl) = if won {
                 ("WON", stake_amount * (1.0 / market_prob - 1.0))
@@ -909,7 +920,8 @@ fn load_open_positions(
         std::collections::HashMap::new();
 
     let mut stmt = match conn.prepare(
-        "SELECT game_id, action, market_implied_prob, model_implied_prob, timestamp \
+        "SELECT game_id, action, market_implied_prob, model_implied_prob, timestamp, \
+                COALESCE(bought_home, CASE WHEN model_implied_prob > market_implied_prob THEN 1 ELSE 0 END) \
          FROM simulated_trades WHERE status = 'OPEN' AND action LIKE 'BUY_%' \
          ORDER BY timestamp ASC",
     ) {
@@ -920,7 +932,7 @@ fn load_open_positions(
         }
     };
 
-    let rows: Vec<(String, String, f64, f64, String)> = stmt
+    let rows: Vec<(String, String, f64, f64, String, bool)> = stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -928,21 +940,20 @@ fn load_open_positions(
                 row.get::<_, f64>(2)?,
                 row.get::<_, f64>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, i64>(5).map(|v| v != 0).unwrap_or(false),
             ))
         })
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
 
-    for (cond_id, action, entry_price, entry_model, ts) in rows {
+    for (cond_id, action, entry_price, entry_model, ts, bought_home) in rows {
         *buy_counts.entry(cond_id.clone()).or_insert(0) += 1;
 
         // Only keep the earliest trade as the reference position
         if positions.contains_key(&cond_id) {
             continue;
         }
-
-        let bought_home = entry_model > entry_price;
 
         // Resolve token info from the current session's registry
         let (token_id, team_name) = registry
@@ -1193,8 +1204,6 @@ async fn run_ws_ingestion(
 
                 let exit_price  = if pos.bought_home { market_prob } else { 1.0 - market_prob };
                 let sell_entry  = if pos.bought_home { pos.entry_price } else { 1.0 - pos.entry_price };
-                // Align model_prob to same team perspective as exit_price so display is consistent
-                let model_display = if pos.bought_home { model_prob } else { 1.0 - model_prob };
 
                 let signed = wallet.sign_order(
                     &pos.token_id, market_prob, STAKE_USDC, wallet::Side::Sell,
@@ -1208,7 +1217,8 @@ async fn run_ws_ingestion(
                     &reason,
                     sell_entry,
                     exit_price,
-                    model_display,
+                    model_prob,
+                    pos.bought_home,
                     signed.as_ref(),
                 ) {
                     error!("DB sell write failed: {e}");
@@ -1290,6 +1300,7 @@ async fn run_ws_ingestion(
                 &action,
                 market_prob,
                 model_prob,
+                bought_home,
                 signed.as_ref(),
             ) {
                 error!("DB write failed: {e}");

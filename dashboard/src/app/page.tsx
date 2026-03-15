@@ -20,6 +20,7 @@ interface Trade {
   pnl:                 number | null;
   order_hash:          string | null;
   signed_tx:           string | null;
+  bought_home:         boolean | null;
 }
 
 interface WalletInfo {
@@ -255,7 +256,7 @@ export default function Dashboard() {
   const totalPnl    = trades.reduce((s, t) => s + (t.pnl ?? 0), 0);
   const totalStaked = trades.reduce((s, t) => s + t.stake_amount, 0);
   const avgEdge     = trades.length > 0
-    ? trades.reduce((s, t) => s + Math.abs(t.model_implied_prob - t.market_implied_prob), 0) / trades.length * 100
+    ? trades.reduce((s, t) => s + Math.abs(alignedProbs(t).edge), 0) / trades.length * 100
     : null;
   const signedCount = trades.filter(t => t.order_hash).length;
 
@@ -706,7 +707,8 @@ export default function Dashboard() {
                   </thead>
                   <tbody>
                     {trades.map(t => {
-                      const edge = (t.model_implied_prob - t.market_implied_prob) * 100;
+                      const { mkt, mdl, edge } = alignedProbs(t);
+                      const edgePct = edge * 100;
                       return (
                         <tr
                           key={t.id}
@@ -722,10 +724,10 @@ export default function Dashboard() {
                             </span>
                           </td>
                           <td className="px-4 py-3 text-gray-400">${t.stake_amount.toFixed(0)}</td>
-                          <td className="px-4 py-3 text-gray-300">{(t.market_implied_prob * 100).toFixed(1)}%</td>
-                          <td className="px-4 py-3 text-gray-300">{(t.model_implied_prob  * 100).toFixed(1)}%</td>
-                          <td className={`px-4 py-3 font-bold ${edge >= 0 ? "text-green-400" : "text-red-400"}`}>
-                            {edge >= 0 ? "+" : ""}{edge.toFixed(1)}%
+                          <td className="px-4 py-3 text-gray-300">{(mkt * 100).toFixed(1)}%</td>
+                          <td className="px-4 py-3 text-gray-300">{(mdl * 100).toFixed(1)}%</td>
+                          <td className={`px-4 py-3 font-bold ${edgePct >= 0 ? "text-green-400" : "text-red-400"}`}>
+                            {edgePct >= 0 ? "+" : ""}{edgePct.toFixed(1)}%
                           </td>
                           <td className="px-4 py-3">
                             {t.order_hash ? (
@@ -819,9 +821,19 @@ function SectionHeader({
   );
 }
 
+/** Return market/model probs aligned to the traded team's perspective.
+ *  Raw DB values are always P(home wins). When bought_home=false we flip both. */
+function alignedProbs(t: Trade): { mkt: number; mdl: number; edge: number } {
+  const flip = t.bought_home === false;
+  const mkt = flip ? 1 - t.market_implied_prob : t.market_implied_prob;
+  const mdl = flip ? 1 - t.model_implied_prob  : t.model_implied_prob;
+  return { mkt, mdl, edge: mdl - mkt };
+}
+
 function ActivePositionCard({ trade }: { trade: Trade }) {
-  const edge      = (trade.model_implied_prob - trade.market_implied_prob) * 100;
-  const isBuyHome = trade.action !== "BUY_AWAY";
+  const { edge } = alignedProbs(trade);
+  const edgePct  = edge * 100;
+  const isBuyHome = trade.bought_home !== false;
   return (
     <div className="bg-gray-900 border border-yellow-900/30 rounded-lg p-4 space-y-3 hover:border-yellow-700/40 transition-colors">
       <div className="flex items-start justify-between gap-3">
@@ -841,10 +853,10 @@ function ActivePositionCard({ trade }: { trade: Trade }) {
           <span className="text-gray-200 font-semibold">${trade.stake_amount.toFixed(0)} USDC</span>
         </DataPoint>
         <DataPoint label="Market odds">
-          <span className="text-gray-300">{(trade.market_implied_prob * 100).toFixed(1)}%</span>
+          <span className="text-gray-300">{(alignedProbs(trade).mkt * 100).toFixed(1)}%</span>
         </DataPoint>
         <DataPoint label="Model confidence">
-          <span className="text-gray-300">{(trade.model_implied_prob * 100).toFixed(1)}%</span>
+          <span className="text-gray-300">{(alignedProbs(trade).mdl * 100).toFixed(1)}%</span>
         </DataPoint>
       </div>
 
