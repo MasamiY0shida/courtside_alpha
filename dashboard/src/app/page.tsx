@@ -584,7 +584,7 @@ export default function Dashboard() {
                             {t.target_team}
                           </td>
                           <td className="px-4 py-3">
-                            <span className={`font-semibold ${t.action !== "BUY_AWAY" ? "text-green-400" : "text-orange-400"}`}>
+                            <span className={`font-semibold ${t.action.startsWith("BUY") ? "text-green-400" : "text-red-400"}`}>
                               {t.action}
                             </span>
                           </td>
