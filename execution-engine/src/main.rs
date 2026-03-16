@@ -377,7 +377,43 @@ fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN away_score  INTEGER", []);
     let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN period      INTEGER", []);
     let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN secs_left   REAL",    []);
+
+    // Market ticks table — logs every Polymarket WebSocket price tick
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS market_ticks (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp  TEXT NOT NULL,
+            game_id    TEXT NOT NULL,
+            asset_id   TEXT NOT NULL,
+            price      REAL NOT NULL,
+            team_name  TEXT NOT NULL,
+            is_home    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tick_game ON market_ticks(game_id);
+        CREATE INDEX IF NOT EXISTS idx_tick_time ON market_ticks(timestamp);",
+    )?;
+
     info!("SQLite ready at {DB_PATH}");
+    Ok(())
+}
+
+/// Log a market price tick from the Polymarket WebSocket.
+fn log_tick(
+    conn: &Connection,
+    game_id: &str,
+    asset_id: &str,
+    price: f64,
+    team_name: &str,
+    is_home: bool,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO market_ticks (timestamp, game_id, asset_id, price, team_name, is_home) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            Utc::now().to_rfc3339(),
+            game_id, asset_id, price, team_name, is_home as i64
+        ],
+    )?;
     Ok(())
 }
 
@@ -1163,6 +1199,16 @@ async fn run_ws_ingestion(
                 "Tick  game=\"{}\"  team={}  is_home={}  market_prob={:.3}",
                 entry.question, entry.team_name, entry.is_home, market_prob
             );
+
+            // Log every tick for market microstructure analysis
+            {
+                let db_guard = db.lock().await;
+                let _ = log_tick(
+                    &db_guard,
+                    &entry.condition_id, &asset_id, market_prob,
+                    &entry.team_name, entry.is_home,
+                );
+            }
 
             // Only process home token — gives P(home wins) directly.
             if !entry.is_home { continue; }

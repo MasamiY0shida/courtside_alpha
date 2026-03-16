@@ -90,15 +90,36 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_snap_time
             ON snapshots(recorded_at);
     """)
+
+    # ── Schema migrations (safe to re-run) ──
+    for col, dtype in [
+        ("boxscore_json",    "TEXT"),
+        ("lineup_json",      "TEXT"),
+        ("pbp_recent_json",  "TEXT"),
+        ("polymarket_bid",   "REAL"),
+        ("polymarket_ask",   "REAL"),
+    ]:
+        try:
+            db.execute(f"ALTER TABLE snapshots ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     db.close()
 
 
-def record_snapshot(game_id, game_state, predictions, market_odds, feature_vector):
+def record_snapshot(
+    game_id, game_state, predictions, market_odds, feature_vector,
+    boxscore_json=None, lineup_json=None, pbp_recent_json=None,
+):
     """
     Record a single observation point during a live game.
 
     Called every ~30 seconds per active game from server.py's poll loop.
     """
+    # Extract bid/ask if available in market_odds
+    bid = market_odds.get("bid") if market_odds else None
+    ask = market_odds.get("ask") if market_odds else None
+
     db = _get_db()
     db.execute("""
         INSERT INTO snapshots (
@@ -107,10 +128,12 @@ def record_snapshot(game_id, game_state, predictions, market_odds, feature_vecto
             period, game_seconds_left, home_score, away_score,
             polymarket_home_prob, polymarket_volume,
             polymarket_spread, polymarket_total,
+            polymarket_bid, polymarket_ask,
             model_win_prob, model_proxy_prob, model_margin,
             model_edge, model_edge_confidence, model_kelly_size,
-            feature_vector
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            feature_vector,
+            boxscore_json, lineup_json, pbp_recent_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         datetime.now(timezone.utc).isoformat(),
         game_id,
@@ -126,6 +149,7 @@ def record_snapshot(game_id, game_state, predictions, market_odds, feature_vecto
         market_odds.get("volume") if market_odds else None,
         market_odds.get("spread") if market_odds else None,
         market_odds.get("total") if market_odds else None,
+        bid, ask,
         predictions.get("win_probability"),
         predictions.get("proxy_probability"),
         predictions.get("predicted_margin"),
@@ -133,6 +157,9 @@ def record_snapshot(game_id, game_state, predictions, market_odds, feature_vecto
         predictions.get("edge_confidence"),
         predictions.get("kelly_size"),
         json.dumps(feature_vector, default=lambda x: float(x) if hasattr(x, 'item') else str(x)) if feature_vector else None,
+        boxscore_json,
+        lineup_json,
+        pbp_recent_json,
     ))
     db.commit()
     db.close()
@@ -176,6 +203,60 @@ def finalize_game(game_id, final_home_score, final_away_score):
     db.commit()
     db.close()
     return home_won
+
+
+# ── Query helpers ────────────────────────────────────────────────────────────
+
+def get_pending_game_ids():
+    """Return game_ids that have snapshots but no outcome (home_won IS NULL)."""
+    if not os.path.exists(DB_PATH):
+        return []
+    db = _get_db()
+    rows = db.execute("""
+        SELECT DISTINCT game_id
+        FROM snapshots
+        WHERE home_won IS NULL
+    """).fetchall()
+    db.close()
+    return [r[0] for r in rows]
+
+
+def get_completed_game_ids():
+    """Return game_ids that already have outcomes backfilled."""
+    if not os.path.exists(DB_PATH):
+        return set()
+    db = _get_db()
+    rows = db.execute("""
+        SELECT DISTINCT game_id
+        FROM snapshots
+        WHERE home_won IS NOT NULL
+    """).fetchall()
+    db.close()
+    return {r[0] for r in rows}
+
+
+def get_pending_games_with_teams():
+    """Return pending games with team info for tracker restoration."""
+    if not os.path.exists(DB_PATH):
+        return []
+    db = _get_db()
+    rows = db.execute("""
+        SELECT DISTINCT game_id, home_team_id, away_team_id,
+               home_tricode, away_tricode
+        FROM snapshots
+        WHERE home_won IS NULL
+    """).fetchall()
+    db.close()
+    return [
+        {
+            "game_id": r[0],
+            "home_team_id": r[1],
+            "away_team_id": r[2],
+            "home_tricode": r[3],
+            "away_tricode": r[4],
+        }
+        for r in rows
+    ]
 
 
 def export_for_training(db_path=None):

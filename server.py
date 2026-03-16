@@ -36,16 +36,16 @@ class ModelSuite:
     def __init__(self):
         print("Loading models...")
         self.win_model = xgb.XGBClassifier()
-        self.win_model.load_model(f"{DATA_DIR}/v2_win_probability.json")
+        self.win_model.load_model(f"{DATA_DIR}/v3_win_probability.json")
 
         self.margin_model = xgb.XGBRegressor()
-        self.margin_model.load_model(f"{DATA_DIR}/v2_margin.json")
+        self.margin_model.load_model(f"{DATA_DIR}/v3_margin.json")
 
         self.proxy_model = xgb.XGBClassifier()
-        self.proxy_model.load_model(f"{DATA_DIR}/v2_market_proxy.json")
+        self.proxy_model.load_model(f"{DATA_DIR}/v3_market_proxy.json")
 
         self.edge_model = xgb.XGBClassifier()
-        self.edge_model.load_model(f"{DATA_DIR}/v2_edge_model.json")
+        self.edge_model.load_model(f"{DATA_DIR}/v3_edge_model.json")
 
         print("All models loaded.")
 
@@ -106,6 +106,31 @@ class GameTracker:
         self.games = {}  # game_id -> state dict
         self.last_poll = None
         self._completed = set()  # game_ids already finalized
+
+    def restore_from_db(self):
+        """Re-populate tracked games from DB so outcomes survive restarts."""
+        # Mark already-completed games so we don't re-finalize
+        self._completed = recorder.get_completed_game_ids()
+
+        # Restore pending games so check_completed_games can find them
+        pending = recorder.get_pending_games_with_teams()
+        for g in pending:
+            gid = g["game_id"]
+            if gid not in self.games:
+                self.games[gid] = {
+                    "game_id": gid,
+                    "home_team_id": g["home_team_id"],
+                    "away_team_id": g["away_team_id"],
+                    "home_tricode": g["home_tricode"],
+                    "away_tricode": g["away_tricode"],
+                    "home_score": 0, "away_score": 0,
+                    "period": 0, "game_clock": "",
+                    "game_seconds_left": 2880,
+                    "play_history": [], "prev_snapshot": None,
+                }
+        if pending:
+            print(f"  Restored {len(pending)} pending games from DB "
+                  f"({len(self._completed)} already completed)")
 
     def update_from_scoreboard(self, scoreboard_data):
         """Parse live scoreboard and update tracked games."""
@@ -185,17 +210,33 @@ class GameTracker:
         """
         Pull live boxscore for a game and enrich the tracked state
         with detailed team + player stats the scoreboard doesn't provide.
+
+        Returns (raw_boxscore_json, lineup_json) for recording.
         """
         state = self.games.get(game_id)
         if not state:
-            return
+            return None, None
 
         try:
             bs = live_boxscore.BoxScore(game_id=game_id)
             data = bs.get_dict().get("game", {})
         except Exception as e:
             print(f"  Boxscore fetch failed for {game_id}: {e}")
-            return
+            return None, None
+
+        # Capture raw boxscore (team-level only to keep size manageable)
+        raw_boxscore = {
+            "homeTeam": {
+                "teamId": data.get("homeTeam", {}).get("teamId"),
+                "statistics": data.get("homeTeam", {}).get("statistics", {}),
+            },
+            "awayTeam": {
+                "teamId": data.get("awayTeam", {}).get("teamId"),
+                "statistics": data.get("awayTeam", {}).get("statistics", {}),
+            },
+        }
+
+        lineup = {"home": [], "away": []}
 
         # ── Team-level stats ─────────────────────────────────────────
         for side, key in [("home", "homeTeam"), ("away", "awayTeam")]:
@@ -258,6 +299,9 @@ class GameTracker:
                 on_court = [p for p in active_players if p.get("oncourt") == "1"]
                 state[f"{prefix}_oncourt_count"] = len(on_court)
 
+                # Record on-court player IDs for lineup tracking
+                lineup[side] = [int(p.get("personId", 0)) for p in on_court]
+
                 # Aggregate +/- of current lineup
                 lineup_pm = sum(
                     p.get("statistics", {}).get("plusMinusPoints", 0.0)
@@ -287,6 +331,42 @@ class GameTracker:
                     and p.get("statistics", {}).get("fieldGoalsPercentage", 0) < 0.3
                 )
                 state[f"{prefix}_cold_shooters"] = cold_players
+
+        import json as _json
+        return (
+            _json.dumps(raw_boxscore),
+            _json.dumps(lineup),
+        )
+
+    def fetch_recent_pbp(self, game_id, window_secs=300):
+        """Fetch recent play-by-play events (last ~5 min)."""
+        state = self.games.get(game_id)
+        if not state:
+            return None
+        try:
+            pbp = live_pbp.PlayByPlay(game_id=game_id)
+            actions = pbp.get_dict().get("game", {}).get("actions", [])
+            # Keep last N events (most recent ~5 minutes)
+            recent = actions[-60:] if len(actions) > 60 else actions
+            # Slim down each event to essential fields
+            slim = []
+            for a in recent:
+                slim.append({
+                    "clock": a.get("clock", ""),
+                    "period": a.get("period", 0),
+                    "type": a.get("actionType", ""),
+                    "sub": a.get("subType", ""),
+                    "team": a.get("teamTricode", ""),
+                    "player": a.get("playerNameI", ""),
+                    "desc": a.get("description", ""),
+                    "score_home": a.get("scoreHome", ""),
+                    "score_away": a.get("scoreAway", ""),
+                })
+            import json as _json2
+            return _json2.dumps(slim)
+        except Exception as e:
+            print(f"  PBP fetch failed for {game_id}: {e}")
+            return None
 
     def check_completed_games(self, scoreboard_data):
         """
@@ -509,7 +589,12 @@ async def poll_live_games():
                     continue
 
                 # Enrich with live boxscore (shooting, fouls, lineups, etc.)
-                tracker.enrich_from_boxscore(game_id)
+                box_result = tracker.enrich_from_boxscore(game_id)
+                boxscore_json = box_result[0] if box_result else None
+                lineup_json = box_result[1] if box_result else None
+
+                # Fetch recent play-by-play events
+                pbp_json = tracker.fetch_recent_pbp(game_id)
 
                 # Build features
                 features = feature_engine.build_feature_vector(state)
@@ -566,8 +651,13 @@ async def poll_live_games():
                         "volume": market.get("volume") if market else None,
                         "spread": market.get("spread") if market else None,
                         "total": market.get("total") if market else None,
+                        "bid": market.get("home_win_prob") if market else None,
+                        "ask": (1 - market["away_win_prob"]) if market and market.get("away_win_prob") is not None else None,
                     } if market_prob is not None else None,
                     feature_vector=features,
+                    boxscore_json=boxscore_json,
+                    lineup_json=lineup_json,
+                    pbp_recent_json=pbp_json,
                 )
 
                 # Log signals
@@ -623,6 +713,18 @@ async def lifespan(app: FastAPI):
     feature_engine = FeatureEngine()
     models = ModelSuite()
     recorder.init_db()
+
+    # Restore game tracker state from DB so outcomes survive restarts
+    tracker.restore_from_db()
+
+    # Backfill outcomes for any completed games from prior sessions
+    from backfill_outcomes import backfill
+    try:
+        filled = backfill()
+        if filled:
+            print(f"Startup: backfilled {filled} game outcomes")
+    except Exception as e:
+        print(f"Startup backfill error (non-fatal): {e}")
 
     polling_active = True
     game_task = asyncio.create_task(poll_live_games())

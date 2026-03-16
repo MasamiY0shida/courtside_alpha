@@ -34,11 +34,11 @@ class FeatureEngine:
             self.off_court = pd.DataFrame()
 
         # Load feature column lists
-        with open(f"{DATA_DIR}/v2_live_features.json") as f:
+        with open(f"{DATA_DIR}/v3_live_features.json") as f:
             self.live_features = json.load(f)
-        with open(f"{DATA_DIR}/v2_pregame_features.json") as f:
+        with open(f"{DATA_DIR}/v3_pregame_features.json") as f:
             self.pregame_features = json.load(f)
-        with open(f"{DATA_DIR}/v2_edge_features.json") as f:
+        with open(f"{DATA_DIR}/v3_edge_features.json") as f:
             self.edge_features = json.load(f)
 
         # Build lookups
@@ -228,13 +228,19 @@ class FeatureEngine:
             "ABS_MARGIN": abs(margin),
             "TOTAL_POINTS": total_points,
             "SCORING_PACE": scoring_pace,
-            # Time interactions
+            # Time interactions (v3: force temporal awareness)
             "MARGIN_X_PROGRESS": margin * game_progress,
             "ABS_MARGIN_X_PROGRESS": abs(margin) * game_progress,
+            "MARGIN_OVER_SQRT_TIME": margin / max(np.sqrt(secs_left / 60), 1.0),
+            "ABS_MARGIN_OVER_SQRT_TIME": abs(margin) / max(np.sqrt(secs_left / 60), 1.0),
+            "TIME_REMAINING_FRAC": secs_left / 2880,
+            "STAT_RELIABILITY": min(total_points / 30.0, 1.0),
+            "PERIOD_ORDINAL": min(period, 5),
             "IS_Q4": int(period == 4),
             "IS_CLOSE_LATE": int((abs(margin) <= 5) and (secs_left <= 300)),
             "IS_BLOWOUT": int(abs(margin) >= 20),
             "IS_CLUTCH": int((abs(margin) <= 5) and (secs_left <= 300) and (period == 4)),
+            "IS_FIRST_HALF": int(period <= 2),
             # Lead history
             "MAX_HOME_LEAD": max_home_lead,
             "MAX_AWAY_LEAD": max_away_lead,
@@ -418,6 +424,12 @@ class FeatureEngine:
         features["LIVE_FOUL_TROUBLE_DIFF"] = (
             features["LIVE_AWAY_FOUL_TROUBLE"] - features["LIVE_HOME_FOUL_TROUBLE"]
         )  # positive = away team in more trouble = good for home
+
+        # v3: Time-damp all LIVE_ features so model trusts them less in Q1
+        damp = max(game_progress, 0.05)
+        for key in list(features.keys()):
+            if key.startswith("LIVE_"):
+                features[key + "_DAMPED"] = features[key] * damp
 
         return features
 

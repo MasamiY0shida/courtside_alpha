@@ -35,20 +35,20 @@ class ModelSuite:
     """Loads and holds all v2 trained models."""
 
     def __init__(self):
-        print("[alpha-engine] Loading v2 models...")
+        print("[alpha-engine] Loading v3 models...")
         self.win_model = xgb.XGBClassifier()
-        self.win_model.load_model(f"{DATA_DIR}/v2_win_probability.json")
+        self.win_model.load_model(f"{DATA_DIR}/v3_win_probability.json")
 
         self.margin_model = xgb.XGBRegressor()
-        self.margin_model.load_model(f"{DATA_DIR}/v2_margin.json")
+        self.margin_model.load_model(f"{DATA_DIR}/v3_margin.json")
 
         self.proxy_model = xgb.XGBClassifier()
-        self.proxy_model.load_model(f"{DATA_DIR}/v2_market_proxy.json")
+        self.proxy_model.load_model(f"{DATA_DIR}/v3_market_proxy.json")
 
         self.edge_model = xgb.XGBClassifier()
-        self.edge_model.load_model(f"{DATA_DIR}/v2_edge_model.json")
+        self.edge_model.load_model(f"{DATA_DIR}/v3_edge_model.json")
 
-        print("[alpha-engine] All v2 models loaded.")
+        print("[alpha-engine] All v3 models loaded.")
 
     def predict(self, features, feature_engine):
         """Run all models and return predictions."""
