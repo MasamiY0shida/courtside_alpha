@@ -21,6 +21,10 @@ interface Trade {
   order_hash:          string | null;
   signed_tx:           string | null;
   bought_home:         boolean | null;
+  home_score:          number | null;
+  away_score:          number | null;
+  period:              number | null;
+  secs_left:           number | null;
 }
 
 interface WalletInfo {
@@ -697,6 +701,10 @@ export default function Dashboard() {
                       <th className="px-4 py-3">Time</th>
                       <th className="px-4 py-3">Game / Team</th>
                       <th className="px-4 py-3">Action</th>
+                      <th className="px-4 py-3">
+                        <div>Score</div>
+                        <div className="text-gray-600 normal-case font-normal text-xs tracking-normal">at trade time</div>
+                      </th>
                       <th className="px-4 py-3">Stake</th>
                       <th className="px-4 py-3">
                         <div>Market %</div>
@@ -739,6 +747,27 @@ export default function Dashboard() {
                             <span className={`font-semibold ${t.action.startsWith("BUY") ? "text-green-400" : "text-red-400"}`}>
                               {t.action}
                             </span>
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap">
+                            {t.home_score != null && t.away_score != null ? (
+                              <div>
+                                <div className="text-gray-200 font-semibold">
+                                  <span className="text-blue-400 font-normal">{teams.home}</span>{" "}
+                                  {t.home_score}–{t.away_score}{" "}
+                                  <span className="text-violet-400 font-normal">{teams.away}</span>
+                                </div>
+                                <div className="text-gray-500 text-xs mt-0.5">
+                                  Q{t.period ?? "?"}
+                                  {t.secs_left != null && (
+                                    <span className="text-gray-600 ml-1">
+                                      {Math.floor(t.secs_left / 60)}:{String(Math.floor(t.secs_left % 60)).padStart(2, "0")}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            ) : (
+                              <span className="text-gray-700">—</span>
+                            )}
                           </td>
                           <td className="px-4 py-3 text-gray-400">${t.stake_amount.toFixed(0)}</td>
                           <td className="px-4 py-3">

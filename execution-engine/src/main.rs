@@ -152,6 +152,9 @@ struct ServerPrediction {
     game_seconds_left: f64,
     win_probability:   f64,
     edge_confidence:   f64,
+    home_score:        i32,
+    away_score:        i32,
+    period:            i32,
 }
 
 // ── Sell policy configuration ─────────────────────────────────────────────────
@@ -316,6 +319,11 @@ struct SimulatedTrade {
     signed_tx:           Option<String>,
     /// True if we hold the home team outcome. Dashboard flips display when false.
     bought_home:         Option<bool>,
+    /// Game state snapshot at trade time
+    home_score:          Option<i32>,
+    away_score:          Option<i32>,
+    period:              Option<i32>,
+    secs_left:           Option<f64>,
 }
 
 /// Response for GET /wallet.
@@ -365,6 +373,10 @@ fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN order_hash  TEXT",    []);
     let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN signed_tx   TEXT",    []);
     let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN bought_home INTEGER", []);
+    let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN home_score  INTEGER", []);
+    let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN away_score  INTEGER", []);
+    let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN period      INTEGER", []);
+    let _ = conn.execute("ALTER TABLE simulated_trades ADD COLUMN secs_left   REAL",    []);
     info!("SQLite ready at {DB_PATH}");
     Ok(())
 }
@@ -408,6 +420,10 @@ fn log_trade(
     model_prob:   f64,
     bought_home:  bool,
     signed_order: Option<&wallet::SignedOrder>,
+    home_score:   i32,
+    away_score:   i32,
+    period:       i32,
+    secs_left:    f64,
 ) -> Result<()> {
     let id        = Uuid::new_v4().to_string();
     let timestamp = Utc::now().to_rfc3339();
@@ -415,23 +431,20 @@ fn log_trade(
     let order_hash: Option<String> = signed_order.map(|s| s.order_hash.clone());
     let signed_tx:  Option<String> = signed_order.map(|s| s.signed_tx.clone());
 
-    // Ensure bought_home column exists (idempotent migration)
-    let _ = conn.execute(
-        "ALTER TABLE simulated_trades ADD COLUMN bought_home INTEGER",
-        [],
-    );
-
-    // Probs stored as raw P(home wins) for reconstruction; display layer flips for away.
+    // Probs stored as raw P(home wins) for reconstruction; display layer shows both teams.
     conn.execute(
         "INSERT INTO simulated_trades
             (id, timestamp, game_id, target_team, action,
              market_implied_prob, model_implied_prob, stake_amount, status, pnl,
-             order_hash, signed_tx, bought_home)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'OPEN', NULL, ?9, ?10, ?11)",
+             order_hash, signed_tx, bought_home,
+             home_score, away_score, period, secs_left)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'OPEN', NULL, ?9, ?10, ?11,
+                 ?12, ?13, ?14, ?15)",
         params![
             id, timestamp, game_id, target_team, action,
             market_prob, model_prob, STAKE_USDC,
-            order_hash, signed_tx, bought_home as i64
+            order_hash, signed_tx, bought_home as i64,
+            home_score, away_score, period, secs_left
         ],
     )?;
 
@@ -462,9 +475,14 @@ fn log_sell_trade(
     reason:       &SellReason,
     entry_price:  f64,
     exit_price:   f64,
+    market_prob:  f64,
     model_prob:   f64,
     bought_home:  bool,
     signed_order: Option<&wallet::SignedOrder>,
+    home_score:   i32,
+    away_score:   i32,
+    period:       i32,
+    secs_left:    f64,
 ) -> Result<()> {
     let id        = Uuid::new_v4().to_string();
     let timestamp = Utc::now().to_rfc3339();
@@ -473,24 +491,28 @@ fn log_sell_trade(
     let order_hash: Option<String> = signed_order.map(|s| s.order_hash.clone());
     let signed_tx:  Option<String> = signed_order.map(|s| s.signed_tx.clone());
 
-    // PnL: proportional to price movement since entry
-    // If bought home at 0.40, now selling at 0.55 → profit = stake * (0.55/0.40 - 1)
+    // PnL: proportional to token price movement since entry
+    // entry_price/exit_price are token prices (flipped for away positions)
     let pnl = if entry_price > 0.001 {
         STAKE_USDC * (exit_price / entry_price - 1.0)
     } else {
         0.0
     };
 
+    // Store market_prob as raw P(home wins) — consistent with BUY rows
     conn.execute(
         "INSERT INTO simulated_trades
             (id, timestamp, game_id, target_team, action,
              market_implied_prob, model_implied_prob, stake_amount, status, pnl,
-             order_hash, signed_tx, bought_home)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'CLOSED', ?9, ?10, ?11, ?12)",
+             order_hash, signed_tx, bought_home,
+             home_score, away_score, period, secs_left)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'CLOSED', ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, ?16)",
         params![
             id, timestamp, game_id, target_team, action,
-            exit_price, model_prob, STAKE_USDC, pnl,
-            order_hash, signed_tx, bought_home as i64
+            market_prob, model_prob, STAKE_USDC, pnl,
+            order_hash, signed_tx, bought_home as i64,
+            home_score, away_score, period, secs_left
         ],
     )?;
 
@@ -530,7 +552,8 @@ async fn handle_get_trades(
         .prepare(
             "SELECT id, timestamp, game_id, target_team, action, \
              market_implied_prob, model_implied_prob, stake_amount, status, pnl, \
-             order_hash, signed_tx, bought_home \
+             order_hash, signed_tx, bought_home, \
+             home_score, away_score, period, secs_left \
              FROM simulated_trades ORDER BY timestamp DESC",
         )
         .unwrap();
@@ -551,6 +574,10 @@ async fn handle_get_trades(
                 order_hash:          row.get(10)?,
                 signed_tx:           row.get(11)?,
                 bought_home:         row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v != 0),
+                home_score:          row.get::<_, Option<i32>>(13).ok().flatten(),
+                away_score:          row.get::<_, Option<i32>>(14).ok().flatten(),
+                period:              row.get::<_, Option<i32>>(15).ok().flatten(),
+                secs_left:           row.get::<_, Option<f64>>(16).ok().flatten(),
             })
         })
         .unwrap()
@@ -893,10 +920,17 @@ fn find_server_prediction(
         let win_probability = preds.get("win_probability")?.as_f64()?;
         let edge_confidence = preds.get("edge_confidence")?.as_f64()?;
 
+        let score = game.get("score");
+        let home_score = score.and_then(|s| s.get("home")).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let away_score = score.and_then(|s| s.get("away")).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
         return Some(ServerPrediction {
             game_seconds_left,
             win_probability,
             edge_confidence,
+            home_score,
+            away_score,
+            period,
         });
     }
 
@@ -1139,11 +1173,12 @@ async fn run_ws_ingestion(
 
             // ── Tier 1: Use server.py full v2 predictions (265 features) ─────
             // ── Tier 2: Fall back to alpha-engine (6 fields, ~93 features zero)
-            let (model_prob, secs_left, edge_confidence) =
+            let (model_prob, secs_left, edge_confidence, g_home_score, g_away_score, g_period) =
                 if let Some(sp) = server_games.as_ref()
                     .and_then(|g| find_server_prediction(g, home_tid, away_tid))
                 {
-                    (sp.win_probability, sp.game_seconds_left, sp.edge_confidence)
+                    (sp.win_probability, sp.game_seconds_left, sp.edge_confidence,
+                     sp.home_score, sp.away_score, sp.period)
                 } else {
                     // Alpha-engine fallback sends pregame state (scores=0).
                     // This is only valid before the game starts — for live games it
@@ -1176,7 +1211,7 @@ async fn run_ws_ingestion(
                         .send().await
                     {
                         Ok(r) => match r.json::<PredictResponse>().await {
-                            Ok(p) => (p.win_probability, 2880.0, p.edge_confidence),
+                            Ok(p) => (p.win_probability, 2880.0, p.edge_confidence, 0, 0, 1),
                             Err(e) => { warn!("Alpha Engine deserialise error: {e}"); continue; }
                         },
                         Err(e) => { warn!("Alpha Engine error: {e}"); continue; }
@@ -1224,9 +1259,14 @@ async fn run_ws_ingestion(
                     &reason,
                     sell_entry,
                     exit_price,
+                    market_prob,
                     model_prob,
                     pos.bought_home,
                     signed.as_ref(),
+                    g_home_score,
+                    g_away_score,
+                    g_period,
+                    secs_left,
                 ) {
                     error!("DB sell write failed: {e}");
                 }
@@ -1319,6 +1359,10 @@ async fn run_ws_ingestion(
                 model_prob,
                 bought_home,
                 signed.as_ref(),
+                g_home_score,
+                g_away_score,
+                g_period,
+                secs_left,
             ) {
                 error!("DB write failed: {e}");
             }
